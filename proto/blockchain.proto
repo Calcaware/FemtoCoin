@@ -1,0 +1,26 @@
+syntax = "proto3";
+package femtochain;
+
+message Transaction {
+  string from = 1;
+  string to = 2;
+  string amount = 3;
+  string fee = 4;
+  uint64 timestamp = 5;
+  string public_key = 6;
+  string signature = 7;
+}
+
+message Block {
+  uint64 index = 1;
+  uint64 timestamp = 2;
+  repeated Transaction transactions = 3;
+  string previous_hash = 4;
+  uint32 difficulty = 5;
+  uint64 nonce = 6;
+  string hash = 7;
+}
+
+message Chain {
+  repeated Block blocks = 1;
+}

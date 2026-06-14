@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FemtoChain Explorer</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #0b0e14; color: #c9d1d9; }
+    .navbar { border-bottom: 1px solid #21262d; }
+    .navbar-brand { font-weight: 700; letter-spacing: -0.5px; }
+    .card { background: #161b22; border: 1px solid #21262d; }
+    .card-header { background: #0d1117; border-bottom: 1px solid #21262d; font-weight: 600; }
+    .hash { font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; font-size: 0.85em; color: #8b949e; }
+    .hash a { color: #58a6ff; text-decoration: none; }
+    .hash a:hover { text-decoration: underline; }
+    .stat-value { font-size: 1.6rem; font-weight: 700; color: #f0f6fc; }
+    .stat-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; }
+    .block-row { padding: 0.5rem 0; border-bottom: 1px solid #21262d; }
+    .block-row:last-child { border-bottom: none; }
+    .badge-diff { background: #1f2937; color: #d2d8e0; }
+    .tx-in { color: #f85149; }
+    .tx-out { color: #3fb950; }
+    .footer { border-top: 1px solid #21262d; color: #484f58; font-size: 0.8rem; }
+    .nav-link.active { background: #1f6feb !important; border-radius: 6px; }
+  </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand">
+  <div class="container">
+    <a class="navbar-brand text-light" href="#"><img src="../assets/femto-logo-white.png" height="24" alt="FemtoChain" class="me-2">femtoscan</a>
+    <div class="navbar-nav flex-row gap-2">
+      <a class="nav-link px-3 py-1 active" href="index.html">Explorer</a>
+      <a class="nav-link px-3 py-1" href="api.html">API</a>
+    </div>
+    <form class="d-flex" onsubmit="searchBlock(event)">
+      <input id="searchInput" class="form-control form-control-sm bg-dark border-secondary text-light" type="search" placeholder="Block index or address" style="width:260px">
+    </form>
+  </div>
+</nav>
+
+<div class="container py-4">
+  <div id="errorAlert" class="alert alert-danger d-none"></div>
+
+  <div class="row g-3 mb-4" id="statsRow">
+    <div class="col-md-2 col-4"><div class="card card-body text-center py-3"><div class="stat-value" id="statBlocks">-</div><div class="stat-label">Blocks</div></div></div>
+    <div class="col-md-2 col-4"><div class="card card-body text-center py-3"><div class="stat-value" id="statSupply">-</div><div class="stat-label">Supply</div></div></div>
+    <div class="col-md-2 col-4"><div class="card card-body text-center py-3"><div class="stat-value" id="statDifficulty">-</div><div class="stat-label">Difficulty</div></div></div>
+    <div class="col-md-2 col-4"><div class="card card-body text-center py-3"><div class="stat-value" id="statReward">-</div><div class="stat-label">Reward</div></div></div>
+    <div class="col-md-2 col-4"><div class="card card-body text-center py-3"><div class="stat-value" id="statValid">-</div><div class="stat-label">Valid</div></div></div>
+    <div class="col-md-2 col-4"><div class="card card-body text-center py-3"><div class="stat-value" id="statLatest">-</div><div class="stat-label">Latest</div></div></div>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-lg-8">
+      <div class="card">
+        <div class="card-header d-flex justify-content-between">
+          <span>Recent Blocks</span>
+          <span class="text-secondary" id="blockCount"></span>
+        </div>
+        <div id="blockList" class="card-body p-0"></div>
+      </div>
+    </div>
+    <div class="col-lg-4">
+      <div class="card mb-3">
+        <div class="card-header">Balance Lookup</div>
+        <div class="card-body">
+          <input id="balanceInput" class="form-control form-control-sm bg-dark border-secondary text-light mb-2" placeholder="Address">
+          <button class="btn btn-sm btn-primary" onclick="lookupBalance()">Check</button>
+          <div id="balanceResult" class="mt-2 small"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">Block Lookup</div>
+        <div class="card-body">
+          <input id="blockIndexInput" class="form-control form-control-sm bg-dark border-secondary text-light mb-2" type="number" placeholder="Block index">
+          <button class="btn btn-sm btn-primary" onclick="lookupBlock()">Fetch</button>
+          <div id="blockResult" class="mt-2 small"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer text-center py-3">
+  FemtoChain &middot; data is read-only from the chain file
+</div>
+
+<script>
+const API = 'http://localhost:4000';
+
+function fromFTM(femto) {
+  const s = String(femto).padStart(16, '0');
+  const intPart = s.slice(0, -15).replace(/^0+/, '') || '0';
+  const decPart = s.slice(-15).replace(/0+$/, '');
+  return intPart + (decPart ? '.' + decPart : '');
+}
+
+async function api(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+  return r.json();
+}
+
+async function loadStats() {
+  const info = await api('/api/info');
+  document.getElementById('statBlocks').textContent = info.blocks;
+  document.getElementById('statSupply').textContent = fromFTM(info.supply) + ' FTM';
+  document.getElementById('statDifficulty').textContent = info.difficulty;
+  document.getElementById('statReward').textContent = fromFTM(info.reward) + ' FTM';
+  document.getElementById('statValid').textContent = info.valid ? 'Yes' : 'No';
+  document.getElementById('statValid').style.color = info.valid ? '#3fb950' : '#f85149';
+  document.getElementById('statLatest').textContent = '#' + info.latestBlock.index;
+}
+
+async function loadBlocks() {
+  const data = await api('/api/blocks?limit=30');
+  document.getElementById('blockCount').textContent = data.total + ' total';
+  const list = document.getElementById('blockList');
+  list.innerHTML = data.blocks.toReversed().map(b => {
+    const time = new Date(b.timestamp).toLocaleString();
+    return '<div class="block-row px-3">' +
+      '<div class="d-flex justify-content-between align-items-center">' +
+        '<div><strong>#' + b.index + '</strong> <span class="hash">' +
+          '<a href="#" onclick="showBlock(' + b.index + ');return false">' + b.hash.slice(0, 16) + '&hellip;</a></span></div>' +
+        '<div><span class="badge badge-diff">' + b.difficulty + '</span> ' +
+        '<span class="tx-out">+' + fromFTM(b.reward) + ' FTM</span></div>' +
+      '</div>' +
+      '<div class="small text-secondary">' + time + ' &middot; ' + b.txCount + ' tx(s)</div>' +
+    '</div>';
+  }).join('');
+}
+
+async function showBlock(index) {
+  const b = await api('/api/blocks/' + index);
+  const tbody = b.transactions.map(tx => {
+    const cls = tx.isCoinbase ? 'tx-out' : 'tx-in';
+    return '<tr><td class="hash">' + (tx.from || '&mdash;') + '</td>' +
+      '<td>' + (tx.isCoinbase ? 'Coinbase' : tx.to) + '</td>' +
+      '<td class="' + cls + '">' + fromFTM(tx.amount) + ' FTM</td>' +
+      '<td>' + fromFTM(tx.fee) + '</td></tr>';
+  }).join('');
+  document.getElementById('blockResult').innerHTML = '' +
+    '<div class="card bg-dark border-secondary mt-2 p-2">' +
+    '<div class="small"><strong>Hash</strong><br><span class="hash">' + b.hash + '</span></div>' +
+    '<div class="small mt-1"><strong>Previous</strong><br><span class="hash">' + b.previousHash + '</span></div>' +
+    '<div class="small mt-1"><strong>Time</strong> ' + new Date(b.timestamp).toLocaleString() + '</div>' +
+    '<div class="small"><strong>Nonce</strong> ' + b.nonce + ' &middot; <strong>Difficulty</strong> ' + b.difficulty + '</div>' +
+    '<table class="table table-sm table-dark mt-2 mb-0 small">' +
+    '<thead><tr><th>From</th><th>To</th><th>Amount</th><th>Fee</th></tr></thead>' +
+    '<tbody>' + tbody + '</tbody></table></div>';
+}
+
+async function lookupBalance() {
+  const addr = document.getElementById('balanceInput').value.trim();
+  if (!addr) return;
+  const data = await api('/api/balance/' + addr);
+  document.getElementById('balanceResult').innerHTML = 'Balance: <strong>' + fromFTM(data.balance) + ' FTM</strong>';
+}
+
+async function lookupBlock() {
+  const idx = document.getElementById('blockIndexInput').value;
+  if (!idx) return;
+  await showBlock(parseInt(idx));
+}
+
+function searchBlock(e) {
+  e.preventDefault();
+  const val = document.getElementById('searchInput').value.trim();
+  if (/^\d+$/.test(val)) { document.getElementById('blockIndexInput').value = val; lookupBlock(); }
+  else if (val.length === 40) { document.getElementById('balanceInput').value = val; lookupBalance(); }
+}
+
+(async function() {
+  try {
+    await loadStats();
+    await loadBlocks();
+  } catch (e) {
+    document.getElementById('errorAlert').textContent = 'Could not connect to API at ' + API + '. Start the API server: node server/api.js';
+    document.getElementById('errorAlert').classList.remove('d-none');
+  }
+})();
+</script>
+</body>
+</html>

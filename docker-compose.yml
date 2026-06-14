@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  node1:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - data1:/app/data
+      - wallets1:/app/wallets
+    command: ["3000"]
+
+  node2:
+    build: .
+    ports:
+      - "3001:3000"
+    volumes:
+      - data2:/app/data
+      - wallets2:/app/wallets
+    command: ["3001", "--seed", "node1:3000"]
+    depends_on:
+      - node1
+
+  node3:
+    build: .
+    ports:
+      - "3002:3000"
+    volumes:
+      - data3:/app/data
+      - wallets3:/app/wallets
+    command: ["3002", "--seed", "node1:3000"]
+    depends_on:
+      - node1
+
+volumes:
+  data1:
+  data2:
+  data3:
+  wallets1:
+  wallets2:
+  wallets3:

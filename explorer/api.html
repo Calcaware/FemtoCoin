@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FemtoChain API Explorer</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #0b0e14; color: #c9d1d9; }
+    .navbar { border-bottom: 1px solid #21262d; }
+    .navbar-brand { font-weight: 700; letter-spacing: -0.5px; }
+    .card { background: #161b22; border: 1px solid #21262d; }
+    .card-header { background: #0d1117; border-bottom: 1px solid #21262d; font-weight: 600; }
+    .endpoint { font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; }
+    .endpoint-method { font-weight: 700; min-width: 4em; display: inline-block; }
+    .method-get { color: #58a6ff; }
+    .method-post { color: #3fb950; }
+    pre { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 1rem; font-size: 0.8rem; overflow-x: auto; }
+    code { color: #f0f6fc; }
+    .response-box { max-height: 300px; overflow-y: auto; }
+    .footer { border-top: 1px solid #21262d; color: #484f58; font-size: 0.8rem; }
+    .nav-link.active { background: #1f6feb !important; border-radius: 6px; }
+  </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand">
+  <div class="container">
+    <a class="navbar-brand text-light" href="index.html"><img src="../assets/femto-logo-white.png" height="24" alt="FemtoChain" class="me-2">femtoscan</a>
+    <div class="navbar-nav flex-row gap-2">
+      <a class="nav-link px-3 py-1" href="index.html">Explorer</a>
+      <a class="nav-link px-3 py-1 active" href="api.html">API</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container py-4">
+  <div id="errorAlert" class="alert alert-danger d-none"></div>
+
+  <div class="card mb-4">
+    <div class="card-header">REST API Reference</div>
+    <div class="card-body">
+      <p class="small text-secondary mb-0">All endpoints return JSON. Run the API server with <code>node server/api.js</code> on port 4000. Click <strong>Try It</strong> to make a live request from this page.</p>
+    </div>
+  </div>
+
+  <div id="endpointList"></div>
+</div>
+
+<div class="footer text-center py-3">
+  FemtoChain &middot; live calls go to http://localhost:4000
+</div>
+
+<script>
+const API = 'http://localhost:4000';
+
+const endpoints = [
+  {
+    method: 'GET', path: '/api/info',
+    desc: 'Chain summary with block count, supply, difficulty, and latest block.',
+    tryArgs: null,
+    curl: 'curl http://localhost:4000/api/info'
+  },
+  {
+    method: 'GET', path: '/api/balance/:address',
+    desc: 'Balance for a given address.',
+    args: [{ key: 'address', val: '58431f362e1527477349a91a6bd23b757de39304' }],
+    curl: 'curl http://localhost:4000/api/balance/58431f362e1527477349a91a6bd23b757de39304'
+  },
+  {
+    method: 'GET', path: '/api/balance?address=',
+    desc: 'Balance via query parameter.',
+    args: [{ key: 'address', val: '58431f362e1527477349a91a6bd23b757de39304' }],
+    curl: 'curl "http://localhost:4000/api/balance?address=58431f362e1527477349a91a6bd23b757de39304"'
+  },
+  {
+    method: 'GET', path: '/api/blocks',
+    desc: 'List recent blocks. Supports <code>?limit=</code> (default 20, max 100) and <code>?offset=</code>.',
+    args: [
+      { key: 'limit', val: '5' },
+      { key: 'offset', val: '0' }
+    ],
+    curl: 'curl "http://localhost:4000/api/blocks?limit=5&offset=0"'
+  },
+  {
+    method: 'GET', path: '/api/blocks/:index',
+    desc: 'Full block details with all transactions.',
+    args: [{ key: 'index', val: '0' }],
+    curl: 'curl http://localhost:4000/api/blocks/0'
+  },
+  {
+    method: 'POST', path: '/api/tx/decode',
+    desc: 'Decode a base64-encoded protobuf transaction.',
+    args: [{ key: 'base64', val: '' }],
+    curl: 'curl -X POST http://localhost:4000/api/tx/decode -H "Content-Type: application/json" -d \'{"base64":"...your base64 tx..."}\''
+  }
+];
+
+function renderEndpoints() {
+  const container = document.getElementById('endpointList');
+  container.innerHTML = endpoints.map((ep, i) => {
+    const methodClass = ep.method === 'GET' ? 'method-get' : 'method-post';
+    const pathDisplay = ep.path;
+    const hasArgs = ep.args && ep.args.length > 0 && ep.args[0].val;
+    const tryBtn = '<button class="btn btn-sm btn-outline-light" onclick="tryEndpoint(' + i + ')">Try It</button>';
+    return '<div class="card mb-3">' +
+      '<div class="card-header d-flex justify-content-between align-items-center">' +
+        '<span class="endpoint"><span class="endpoint-method ' + methodClass + '">' + ep.method + '</span> ' + pathDisplay + '</span>' +
+        tryBtn +
+      '</div>' +
+      '<div class="card-body">' +
+        '<p class="small mb-2">' + ep.desc + '</p>' +
+        '<pre class="mb-0"><code>' + ep.curl + '</code></pre>' +
+        '<div id="response-' + i + '" class="mt-2 d-none"></div>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+async function tryEndpoint(index) {
+  const ep = endpoints[index];
+  const respDiv = document.getElementById('response-' + index);
+  respDiv.classList.remove('d-none');
+  respDiv.innerHTML = '<div class="text-secondary small">Loading...</div>';
+
+  let url = API + ep.path;
+  if (ep.args && ep.args.length > 0) {
+    if (ep.path.includes(':address') || ep.path.includes(':index')) {
+      const val = ep.args[0].val;
+      url = API + ep.path.replace(/:\w+/, val);
+    } else {
+      const params = ep.args.map(a => a.key + '=' + encodeURIComponent(a.val)).join('&');
+      url = API + ep.path + '?' + params;
+    }
+  }
+
+  try {
+    const opts = { method: ep.method };
+    if (ep.method === 'POST') {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify({ base64: ep.args[0].val || '' });
+    }
+    const r = await fetch(url, opts);
+    const body = await r.text();
+    let pretty;
+    try { pretty = JSON.stringify(JSON.parse(body), null, 2); }
+    catch (e) { pretty = body; }
+    const statusColor = r.ok ? '#3fb950' : '#f85149';
+    respDiv.innerHTML = '<div class="small mb-1"><span style="color:' + statusColor + '">HTTP ' + r.status + '</span></div>' +
+      '<pre class="response-box"><code>' + escapeHtml(pretty) + '</code></pre>';
+  } catch (e) {
+    respDiv.innerHTML = '<div class="small text-danger">Connection failed. Is the API server running on port 4000?</div>';
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+renderEndpoints();
+</script>
+</body>
+</html>
