@@ -11,16 +11,17 @@ function tempDir() {
   return path.join('/tmp', 'api-test-' + Date.now() + '-' + Math.random().toString(36).slice(2));
 }
 
-function get(url) {
+function get(url, headers = {}) {
   return new Promise((resolve, reject) => {
-    http.get(url, (res) => {
+    const req = http.get(url, { headers }, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
         try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
         catch (e) { resolve({ status: res.statusCode, body: data }); }
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
   });
 }
 
@@ -152,5 +153,26 @@ describe('API Server (standalone)', () => {
       req.end();
     });
     assert.strictEqual(status, 204);
+  });
+
+  it('rejects requests without a bearer token when API auth is configured', async () => {
+    const authDir = tempDir();
+    const Blockchain = require('../lib/chain');
+    const chain = new Blockchain(authDir);
+    const kp = crypto.generateKeypair();
+    const addr = crypto.addressFromPublicKey(kp.publicKey);
+    chain.mineBlock(addr);
+
+    const authServer = start(45903, authDir, { apiToken: 'secret-token' });
+    try {
+      const unauthorized = await get(`http://localhost:45903/api/info`);
+      assert.strictEqual(unauthorized.status, 401);
+
+      const authorized = await get(`http://localhost:45903/api/info`, { Authorization: 'Bearer secret-token' });
+      assert.strictEqual(authorized.status, 200);
+    } finally {
+      authServer.close();
+      fs.rmSync(authDir, { recursive: true, force: true });
+    }
   });
 });

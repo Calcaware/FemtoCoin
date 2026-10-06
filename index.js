@@ -6,7 +6,7 @@ const readline = require('readline');
 const Blockchain = require('./lib/chain');
 const Transaction = require('./lib/transaction');
 const Node = require('./lib/node');
-const { Wallet } = require('./lib/wallet');
+const { Wallet, validateWalletName } = require('./lib/wallet');
 const { COIN, toFTM, parseFTM } = require('./lib/unit');
 
 const DATA_DIR = path.join(__dirname, 'data');
@@ -141,10 +141,16 @@ async function loadWalletWithPassword(name, rl) {
 }
 
 function resolveAddress(arg) {
-  const walletPath = path.join(WALLET_DIR, `${arg}.json`);
-  if (fs.existsSync(walletPath)) {
-    const data = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
-    return data.address;
+  if (typeof arg !== 'string') return arg;
+  try {
+    const safeName = validateWalletName(arg);
+    const walletPath = path.join(WALLET_DIR, `${safeName}.json`);
+    if (fs.existsSync(walletPath)) {
+      const data = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
+      return data.address;
+    }
+  } catch (_) {
+    return arg;
   }
   return arg;
 }
@@ -174,9 +180,12 @@ Explorer:      open explorer/index.html in a browser
 }
 
 async function createWallet(args, rl) {
-  const encrypted = args[0] === '-e' || args[0] === '--encrypted';
-  const name = encrypted ? args[1] : args[0];
-  if (!name) throw new Error('Usage: create-wallet [-e] <name>');
+  const secureDefault = process.env.FEMTOCHAIN_SECURE_WALLETS === '1';
+  const plain = args[0] === '--plain' || args[0] === '-p';
+  const encrypted = args[0] === '-e' || args[0] === '--encrypted' || (!plain && secureDefault);
+  const name = plain ? args[1] : encrypted ? args[1] : args[0];
+
+  if (!name) throw new Error('Usage: create-wallet [-e|--plain] <name>');
 
   const wallet = new Wallet(WALLET_DIR);
   wallet.createNew();

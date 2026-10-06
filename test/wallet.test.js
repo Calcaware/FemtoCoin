@@ -149,4 +149,15 @@ describe('Wallet', () => {
       addressFromPublicKey(wallet.keypair.publicKey)
     );
   });
+
+  it('wallet names reject traversal and path injection values', () => {
+    const dir = tempDir();
+    const wallet = new Wallet(dir);
+    wallet.createNew();
+
+    assert.throws(() => wallet.save('../evil'), /invalid path/);
+    assert.throws(() => wallet.save('a/b'), /invalid path/);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });

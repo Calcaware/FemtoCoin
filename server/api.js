@@ -6,24 +6,100 @@ const { COIN, toFTM, parseFTM } = require('../lib/unit');
 
 const DEFAULT_PORT = 4000;
 const DATA_DIR = path.join(__dirname, '..', 'data');
+const MAX_REQUESTS_PER_MINUTE = Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
-function start(port, dataDir) {
+const RATE_LIMIT_STORE = new Map();
+
+function getCorsOrigin(req) {
+  const configured = process.env.FEMTOCHAIN_CORS_ORIGIN || '';
+  if (configured) return configured;
+
+  const origin = req.headers.origin;
+  if (!origin) return '*';
+
+  const allowList = ['http://localhost', 'http://127.0.0.1'];
+  if (allowList.some(prefix => origin.startsWith(prefix))) {
+    return origin;
+  }
+
+  return 'null';
+}
+
+function getAuthToken() {
+  return process.env.FEMTOCHAIN_API_TOKEN || '';
+}
+
+function enforceRateLimit(req, res, limit) {
+  const maxRequests = Number(limit || MAX_REQUESTS_PER_MINUTE);
+  if (maxRequests <= 0) return false;
+
+  const ip = req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const bucket = RATE_LIMIT_STORE.get(ip) || { count: 0, start: now };
+
+  if (now - bucket.start > RATE_LIMIT_WINDOW_MS) {
+    bucket.count = 0;
+    bucket.start = now;
+  }
+
+  bucket.count += 1;
+  RATE_LIMIT_STORE.set(ip, bucket);
+
+  if (bucket.count > maxRequests) {
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Rate limit exceeded' }) + '\n');
+    return true;
+  }
+
+  return false;
+}
+
+function enforceAuth(req, res, expectedToken) {
+  if (!expectedToken) return false;
+
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (token !== expectedToken) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }) + '\n');
+    return true;
+  }
+
+  return false;
+}
+
+function start(port, dataDir, options = {}) {
   const chain = new Blockchain(dataDir);
-  const server = http.createServer((req, res) => handle(req, res, chain, port));
+  const apiToken = options.apiToken || process.env.FEMTOCHAIN_API_TOKEN || '';
+  const rateLimit = options.rateLimit || Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
+  const server = http.createServer((req, res) => handle(req, res, chain, port, apiToken, rateLimit));
   server.listen(port, () => {
     console.log(`FemtoChain API on http://localhost:${port}`);
   });
   return server;
 }
 
-function handle(req, res, chain, listenPort) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+function handle(req, res, chain, listenPort, apiToken, rateLimit) {
+  const origin = getCorsOrigin(req);
+  res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
+    return;
+  }
+
+  const configuredToken = apiToken || getAuthToken();
+  if (configuredToken) {
+    const authBlocked = enforceAuth(req, res, configuredToken);
+    if (authBlocked) return;
+  }
+
+  const currentLimit = Number(rateLimit || MAX_REQUESTS_PER_MINUTE);
+  if (currentLimit > 0 && enforceRateLimit(req, res, currentLimit)) {
     return;
   }
 
@@ -164,11 +240,17 @@ if (require.main === module) {
   const args = process.argv.slice(2);
   let port = DEFAULT_PORT;
   let dataDir = DATA_DIR;
+  let apiToken = process.env.FEMTOCHAIN_API_TOKEN || '';
+  let rateLimit = Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
+
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' || args[i] === '-p') port = parseInt(args[++i]);
     else if (args[i] === '--data-dir' || args[i] === '-d') dataDir = args[++i];
+    else if (args[i] === '--auth-token' || args[i] === '-t') apiToken = args[++i];
+    else if (args[i] === '--rate-limit' || args[i] === '-r') rateLimit = parseInt(args[++i]);
   }
-  start(port, dataDir);
+
+  start(port, dataDir, { apiToken, rateLimit });
 }
 
 module.exports = { start };

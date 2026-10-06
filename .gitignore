@@ -1,4 +1,17 @@
 node_modules/
+dist/
+coverage/
+.DS_Store
+.vscode/
+.idea/
+*.log
+*.tmp
+*.bak
+*.swp
+.env
+.env.*
+# Local blockchain runtime data
 data/
 wallets/
-.env
+# TypeScript cache
+*.tsbuildinfo

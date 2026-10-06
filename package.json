@@ -1,11 +1,14 @@
 {
   "name": "femtochain",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "A legitimate blockchain implementation in JavaScript",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "audit": "npm audit --audit-level=moderate",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "keywords": [
     "blockchain",
@@ -13,7 +16,11 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "protobufjs": "^8.6.3",
+    "protobufjs": "^8.8.0",
     "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
   }
 }

@@ -48,6 +48,46 @@ ftm[3000]> help                                   Print this help
 ftm[3000]> exit                                   Shutdown
 ```
 
+## Test suite
+
+The project includes a full automated suite covering the blockchain engine, wallet logic, peer behavior, and REST API.
+
+Test files:
+
+- test/crypto.test.js
+- test/unit.test.js
+- test/transaction.test.js
+- test/block.test.js
+- test/chain.test.js
+- test/wallet.test.js
+- test/node.test.js
+- test/peer.test.js
+- test/api.test.js
+
+Run all tests with:
+
+```bash
+node --test
+```
+
+See [TEST_PLAN.md](./TEST_PLAN.md) for a detailed coverage summary.
+
+## Security and hardening notes
+
+The project now includes a few security defaults for safer use:
+
+- Wallet names are validated before file access to prevent path traversal.
+- API bearer-token support can be enabled with FEMTOCHAIN_API_TOKEN.
+- API rate limiting can be configured with FEMTOCHAIN_API_RATE_LIMIT.
+- Peer and payload limits are enforced in the node layer.
+- Dependency checks should run regularly with `npm audit`.
+
+Example:
+
+```bash
+FEMTOCHAIN_API_TOKEN=secret FEMTOCHAIN_SECURE_WALLETS=1 node index.js
+```
+
 ## Architecture
 
 ### Project Structure
