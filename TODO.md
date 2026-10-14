@@ -9,6 +9,7 @@
 - ✅ API auth and rate limiting implemented
 - ✅ Health/status endpoint implemented (`GET /health`)
 - ✅ API request body size capped (`413 Payload Too Large`)
+- ✅ HTTP server timeouts implemented (slowloris protection)
 
 ## Phase 1: Completed ✅
 - [x] Upgrade protobufjs to patched version (8.8.0+)
@@ -82,7 +83,8 @@
 
 - [ ] **Remove the dead `lib/api.js` duplicate** - `lib/api.js` is unreferenced dead code (only `server/api.js` is loaded) that duplicates the API surface but omits the auth, CORS allowlist, and rate-limiting hardening. Delete it or consolidate everything into one API implementation so the insecure variant cannot be shipped by mistake.
 - [x] **Cap API request body size** - `readBody()` in `server/api.js` now reads with a fixed maximum length (default 1 MiB, configurable via `FEMTOCHAIN_API_MAX_BODY` or `--max-body`) and returns `413 Payload Too Large` for oversized bodies instead of buffering them in memory.
-- [ ] **Add HTTP server timeouts** - Set `headersTimeout`, `requestTimeout`, and `keepAliveTimeout` on the API server so slow or stalled clients (slowloris-style) cannot hold connections open indefinitely.
+- [x] **Add HTTP server timeouts** - `headersTimeout`, `requestTimeout`, and `keepAliveTimeout` are now set on the API server (configurable via `FEMTOCHAIN_API_HEADERS_TIMEOUT`, `FEMTOCHAIN_API_REQUEST_TIMEOUT`, `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT`, and `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL`) so slow or stalled clients cannot hold connections open indefinitely.
+- [ ] **Bound the API rate-limit store** - The `RATE_LIMIT_STORE` map in `server/api.js` only ever grows: every distinct client IP creates a permanent entry, so a large or spoofed address space can slowly exhaust memory. Add periodic pruning of expired buckets (and/or a size cap with LRU eviction) so the limiter cannot be used as a memory-exhaustion vector.
 - [ ] **Add ESLint/Prettier** - Consistent code style enforcement
 - [ ] **Improve inline documentation** - Add JSDoc/TSDoc comments for public APIs
 - [ ] **Update README with hardening guide** - Document security best practices, env vars, production setup
@@ -95,6 +97,10 @@ Key environment variables for hardened deployments:
 - `FEMTOCHAIN_API_TOKEN` - Bearer token for API auth
 - `FEMTOCHAIN_API_RATE_LIMIT` - Requests per minute (default varies)
 - `FEMTOCHAIN_API_MAX_BODY` - Maximum API request body size in bytes (default 1048576)
+- `FEMTOCHAIN_API_HEADERS_TIMEOUT` - Milliseconds allowed to receive request headers (default 60000)
+- `FEMTOCHAIN_API_REQUEST_TIMEOUT` - Milliseconds allowed for the whole request (default 300000)
+- `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT` - Milliseconds an idle keep-alive socket is retained (default 5000)
+- `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL` - Milliseconds between timeout sweeps of open connections (default 30000)
 - `FEMTOCHAIN_CORS_ORIGIN` - Allowed CORS origins (comma-separated)
 - `FEMTOCHAIN_SECURE_WALLETS` - Require encrypted wallets by default (1/0)
 - `FEMTOCHAIN_MAX_PEERS` - Maximum concurrent peer connections

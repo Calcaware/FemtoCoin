@@ -1,9 +1,10 @@
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert');
 const http = require('http');
+const net = require('net');
 const path = require('path');
 const fs = require('fs');
-const { start } = require('../server/api');
+const { start, applyServerTimeouts } = require('../server/api');
 const crypto = require('../lib/crypto');
 const { COIN } = require('../lib/unit');
 
@@ -266,5 +267,71 @@ describe('API Server body size limit', () => {
       req.end();
     });
     assert.strictEqual(status, 413);
+  });
+});
+
+describe('API Server HTTP timeouts', () => {
+  function closeServer(server) {
+    return new Promise((resolve) => server.close(resolve));
+  }
+
+  it('applies configurable socket timeouts to the server', async () => {
+    const dir = tempDir();
+    const server = start(0, dir, { headersTimeout: 25000, requestTimeout: 90000, keepAliveTimeout: 3000 });
+    try {
+      await new Promise((resolve) => server.once('listening', resolve));
+      assert.strictEqual(server.keepAliveTimeout, 3000);
+      assert.strictEqual(server.headersTimeout, 25000);
+      assert.strictEqual(server.requestTimeout, 90000);
+      assert.ok(server.connectionsCheckingInterval <= server.headersTimeout);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps headersTimeout greater than keepAliveTimeout', () => {
+    const server = {};
+    applyServerTimeouts(server, { headersTimeout: 1000, keepAliveTimeout: 5000, requestTimeout: 10000 });
+    assert.ok(server.headersTimeout > server.keepAliveTimeout);
+    assert.ok(server.requestTimeout >= server.headersTimeout);
+  });
+
+  it('falls back to safe defaults for invalid timeout values', () => {
+    const server = {};
+    applyServerTimeouts(server, { headersTimeout: -1, requestTimeout: 'abc', keepAliveTimeout: 0 });
+    assert.ok(Number.isFinite(server.keepAliveTimeout) && server.keepAliveTimeout > 0);
+    assert.ok(Number.isFinite(server.headersTimeout) && server.headersTimeout > 0);
+    assert.ok(Number.isFinite(server.requestTimeout) && server.requestTimeout > 0);
+  });
+
+  it('drops clients that never send request headers (slowloris)', async () => {
+    const dir = tempDir();
+    const server = start(0, dir, {
+      headersTimeout: 200,
+      keepAliveTimeout: 100,
+      requestTimeout: 2000,
+      connectionsCheckingInterval: 50
+    });
+    await new Promise((resolve) => server.once('listening', resolve));
+    const { port: livePort } = server.address();
+    try {
+      const outcome = await new Promise((resolve) => {
+        const socket = net.connect(livePort, '127.0.0.1');
+        // Resume the socket so the 408 response and the server's FIN are read;
+        // otherwise a paused socket never observes EOF and no 'close' fires.
+        socket.resume();
+        const timer = setTimeout(() => {
+          socket.destroy();
+          resolve('still-open');
+        }, 5000);
+        socket.on('close', () => { clearTimeout(timer); resolve('closed'); });
+        socket.on('error', () => { clearTimeout(timer); resolve('closed'); });
+      });
+      assert.strictEqual(outcome, 'closed');
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

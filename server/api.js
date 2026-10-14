@@ -10,6 +10,10 @@ const MAX_REQUESTS_PER_MINUTE = Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 const MAX_BODY_BYTES = Number(process.env.FEMTOCHAIN_API_MAX_BODY || DEFAULT_MAX_BODY_BYTES);
+const DEFAULT_HEADERS_TIMEOUT_MS = 60 * 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_KEEPALIVE_TIMEOUT_MS = 5 * 1000;
+const DEFAULT_CONNECTIONS_CHECK_INTERVAL_MS = 30 * 1000;
 
 const RATE_LIMIT_STORE = new Map();
 
@@ -71,12 +75,49 @@ function enforceAuth(req, res, expectedToken) {
   return false;
 }
 
+// Coerces a configured timeout into a positive finite number of milliseconds,
+// falling back to a safe default when the value is missing or invalid.
+function resolveTimeout(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Sets per-socket HTTP timeouts so slow or stalled clients cannot keep
+// connections open indefinitely and exhaust the server (slowloris-style).
+function applyServerTimeouts(server, timeouts = {}) {
+  const keepAliveTimeout = resolveTimeout(timeouts.keepAliveTimeout, DEFAULT_KEEPALIVE_TIMEOUT_MS);
+  const headersTimeout = resolveTimeout(timeouts.headersTimeout, DEFAULT_HEADERS_TIMEOUT_MS);
+  const requestTimeout = resolveTimeout(timeouts.requestTimeout, DEFAULT_REQUEST_TIMEOUT_MS);
+
+  server.keepAliveTimeout = keepAliveTimeout;
+  // Node requires headersTimeout to be larger than keepAliveTimeout so idle
+  // keep-alive sockets are not torn down before the next request headers.
+  server.headersTimeout = Math.max(headersTimeout, keepAliveTimeout + 1000);
+  server.requestTimeout = Math.max(requestTimeout, server.headersTimeout);
+
+  // Node only evaluates the header/request deadlines on this interval, so keep
+  // it no larger than the smallest timeout for timely enforcement.
+  const checkInterval = resolveTimeout(
+    timeouts.connectionsCheckingInterval,
+    DEFAULT_CONNECTIONS_CHECK_INTERVAL_MS
+  );
+  server.connectionsCheckingInterval = Math.min(checkInterval, server.headersTimeout);
+  return server;
+}
+
 function start(port, dataDir, options = {}) {
   const chain = new Blockchain(dataDir);
   const apiToken = options.apiToken || process.env.FEMTOCHAIN_API_TOKEN || '';
   const rateLimit = options.rateLimit || Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
   const maxBodyBytes = options.maxBodyBytes || MAX_BODY_BYTES;
   const server = http.createServer((req, res) => handle(req, res, chain, port, apiToken, rateLimit, maxBodyBytes));
+  applyServerTimeouts(server, {
+    headersTimeout: options.headersTimeout ?? process.env.FEMTOCHAIN_API_HEADERS_TIMEOUT,
+    requestTimeout: options.requestTimeout ?? process.env.FEMTOCHAIN_API_REQUEST_TIMEOUT,
+    keepAliveTimeout: options.keepAliveTimeout ?? process.env.FEMTOCHAIN_API_KEEPALIVE_TIMEOUT,
+    connectionsCheckingInterval:
+      options.connectionsCheckingInterval ?? process.env.FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL
+  });
   server.listen(port, () => {
     console.log(`FemtoChain API on http://localhost:${port}`);
   });
@@ -311,6 +352,10 @@ if (require.main === module) {
   let apiToken = process.env.FEMTOCHAIN_API_TOKEN || '';
   let rateLimit = Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
   let maxBodyBytes = Number(process.env.FEMTOCHAIN_API_MAX_BODY || DEFAULT_MAX_BODY_BYTES);
+  let headersTimeout = process.env.FEMTOCHAIN_API_HEADERS_TIMEOUT;
+  let requestTimeout = process.env.FEMTOCHAIN_API_REQUEST_TIMEOUT;
+  let keepAliveTimeout = process.env.FEMTOCHAIN_API_KEEPALIVE_TIMEOUT;
+  let connectionsCheckingInterval = process.env.FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' || args[i] === '-p') port = parseInt(args[++i]);
@@ -318,9 +363,16 @@ if (require.main === module) {
     else if (args[i] === '--auth-token' || args[i] === '-t') apiToken = args[++i];
     else if (args[i] === '--rate-limit' || args[i] === '-r') rateLimit = parseInt(args[++i]);
     else if (args[i] === '--max-body' || args[i] === '-b') maxBodyBytes = parseInt(args[++i]);
+    else if (args[i] === '--headers-timeout') headersTimeout = parseInt(args[++i]);
+    else if (args[i] === '--request-timeout') requestTimeout = parseInt(args[++i]);
+    else if (args[i] === '--keepalive-timeout') keepAliveTimeout = parseInt(args[++i]);
+    else if (args[i] === '--check-interval') connectionsCheckingInterval = parseInt(args[++i]);
   }
 
-  start(port, dataDir, { apiToken, rateLimit, maxBodyBytes });
+  start(port, dataDir, {
+    apiToken, rateLimit, maxBodyBytes,
+    headersTimeout, requestTimeout, keepAliveTimeout, connectionsCheckingInterval
+  });
 }
 
-module.exports = { start };
+module.exports = { start, applyServerTimeouts };

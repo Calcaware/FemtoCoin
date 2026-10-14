@@ -36,6 +36,7 @@ The suite verifies:
 - wallet file safety and encrypted keystore handling
 - API request and error handling
 - oversized API request bodies are rejected with 413 rather than buffered
+- HTTP header/request/keep-alive timeouts are configured and stalled clients are dropped
 - node-level limits for peer and message abuse
 - peer metadata and communication logic
 
