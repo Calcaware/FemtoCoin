@@ -56,6 +56,12 @@ const API = 'http://localhost:4000';
 
 const endpoints = [
   {
+    method: 'GET', path: '/health',
+    desc: 'Lightweight liveness/readiness probe. Returns 200 when the chain is valid, 503 otherwise. Unauthenticated and exempt from rate limiting.',
+    tryArgs: null,
+    curl: 'curl http://localhost:4000/health'
+  },
+  {
     method: 'GET', path: '/api/info',
     desc: 'Chain summary with block count, supply, difficulty, and latest block.',
     tryArgs: null,

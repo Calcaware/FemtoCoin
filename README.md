@@ -79,7 +79,9 @@ The project now includes a few security defaults for safer use:
 - Wallet names are validated before file access to prevent path traversal.
 - API bearer-token support can be enabled with FEMTOCHAIN_API_TOKEN.
 - API rate limiting can be configured with FEMTOCHAIN_API_RATE_LIMIT.
+- API request bodies are capped (default 1 MiB, configurable with FEMTOCHAIN_API_MAX_BODY) and oversized requests get a `413 Payload Too Large` response instead of being buffered in memory.
 - Peer and payload limits are enforced in the node layer.
+- A health/readiness probe is exposed at `GET /health` (alias `GET /api/health`). It is unauthenticated and exempt from rate limiting so load balancers and orchestrators can always reach it, and it returns `503` when the chain fails validation.
 - Dependency checks should run regularly with `npm audit`.
 
 Example:

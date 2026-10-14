@@ -2,12 +2,14 @@ const http = require('http');
 const path = require('path');
 const Blockchain = require('../lib/chain');
 const Transaction = require('../lib/transaction');
-const { COIN, toFTM, parseFTM } = require('../lib/unit');
+const { version: PKG_VERSION } = require('../package.json');
 
 const DEFAULT_PORT = 4000;
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const MAX_REQUESTS_PER_MINUTE = Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+const MAX_BODY_BYTES = Number(process.env.FEMTOCHAIN_API_MAX_BODY || DEFAULT_MAX_BODY_BYTES);
 
 const RATE_LIMIT_STORE = new Map();
 
@@ -73,14 +75,15 @@ function start(port, dataDir, options = {}) {
   const chain = new Blockchain(dataDir);
   const apiToken = options.apiToken || process.env.FEMTOCHAIN_API_TOKEN || '';
   const rateLimit = options.rateLimit || Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
-  const server = http.createServer((req, res) => handle(req, res, chain, port, apiToken, rateLimit));
+  const maxBodyBytes = options.maxBodyBytes || MAX_BODY_BYTES;
+  const server = http.createServer((req, res) => handle(req, res, chain, port, apiToken, rateLimit, maxBodyBytes));
   server.listen(port, () => {
     console.log(`FemtoChain API on http://localhost:${port}`);
   });
   return server;
 }
 
-function handle(req, res, chain, listenPort, apiToken, rateLimit) {
+function handle(req, res, chain, listenPort, apiToken, rateLimit, maxBodyBytes = MAX_BODY_BYTES) {
   const origin = getCorsOrigin(req);
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -90,6 +93,15 @@ function handle(req, res, chain, listenPort, apiToken, rateLimit) {
     res.writeHead(204);
     res.end();
     return;
+  }
+
+  const url = new URL(req.url, `http://localhost:${listenPort}`);
+  const path = url.pathname.replace(/\/+$/, '') || '/';
+
+  // Health checks are intentionally unauthenticated and exempt from rate
+  // limiting so load balancers and monitoring probes can always reach them.
+  if ((path === '/health' || path === '/api/health') && req.method === 'GET') {
+    return sendHealth(res, chain);
   }
 
   const configuredToken = apiToken || getAuthToken();
@@ -102,9 +114,6 @@ function handle(req, res, chain, listenPort, apiToken, rateLimit) {
   if (currentLimit > 0 && enforceRateLimit(req, res, currentLimit)) {
     return;
   }
-
-  const url = new URL(req.url, `http://localhost:${listenPort}`);
-  const path = url.pathname.replace(/\/+$/, '') || '/';
 
   try {
     if (path === '/api/info' && req.method === 'GET') {
@@ -138,7 +147,7 @@ function handle(req, res, chain, listenPort, apiToken, rateLimit) {
       return json(res, { peers: [], note: 'Peers only available on a live node' });
     }
     if (path === '/api/tx/decode' && req.method === 'POST') {
-      return readBody(req, res, (body) => {
+      return readBody(req, res, maxBodyBytes, (body) => {
         try {
           const tx = Transaction.decode(body.base64);
           return json(res, {
@@ -162,6 +171,35 @@ function bigintReplacer(key, value) {
   return value;
 }
 
+// Lightweight liveness/readiness probe. Returns 200 when the node's chain is
+// valid and 503 when it is not, so orchestrators can restart unhealthy nodes.
+function sendHealth(res, chain) {
+  let chainValid = false;
+  let blocks = 0;
+  let latestHash = null;
+  try {
+    chainValid = chain.isValid();
+    blocks = chain.getBlockCount();
+    const latest = chain.getLatestBlock();
+    latestHash = latest ? latest.hash : null;
+  } catch (_) {
+    chainValid = false;
+  }
+
+  const body = {
+    status: chainValid ? 'ok' : 'unhealthy',
+    uptime: Math.floor(process.uptime()),
+    timestamp: Date.now(),
+    blocks,
+    chainValid,
+    latestBlock: latestHash,
+    version: PKG_VERSION || null
+  };
+
+  res.writeHead(chainValid ? 200 : 503, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body, bigintReplacer, 2) + '\n');
+}
+
 function json(res, data) {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data, bigintReplacer, 2) + '\n');
@@ -172,12 +210,42 @@ function error(res, status, message) {
   res.end(JSON.stringify({ error: message }) + '\n');
 }
 
-function readBody(req, res, cb) {
+// Buffers a request body up to a fixed maximum size. Oversized bodies are
+// rejected with 413 and are not accumulated in memory, preventing a single
+// large POST from exhausting the node's memory.
+function readBody(req, res, maxBytes = MAX_BODY_BYTES, cb) {
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    error(res, 413, 'Payload too large');
+    req.resume();
+    return;
+  }
+
   let body = '';
-  req.on('data', c => body += c);
+  let size = 0;
+  let finished = false;
+
+  req.on('data', (chunk) => {
+    if (finished) return;
+    size += chunk.length;
+    if (size > maxBytes) {
+      finished = true;
+      body = '';
+      error(res, 413, 'Payload too large');
+      return;
+    }
+    body += chunk;
+  });
   req.on('end', () => {
+    if (finished) return;
+    finished = true;
     try { cb(JSON.parse(body)); }
     catch (e) { error(res, 400, 'Invalid JSON'); }
+  });
+  req.on('error', () => {
+    if (finished) return;
+    finished = true;
+    error(res, 400, 'Request error');
   });
 }
 
@@ -242,15 +310,17 @@ if (require.main === module) {
   let dataDir = DATA_DIR;
   let apiToken = process.env.FEMTOCHAIN_API_TOKEN || '';
   let rateLimit = Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
+  let maxBodyBytes = Number(process.env.FEMTOCHAIN_API_MAX_BODY || DEFAULT_MAX_BODY_BYTES);
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' || args[i] === '-p') port = parseInt(args[++i]);
     else if (args[i] === '--data-dir' || args[i] === '-d') dataDir = args[++i];
     else if (args[i] === '--auth-token' || args[i] === '-t') apiToken = args[++i];
     else if (args[i] === '--rate-limit' || args[i] === '-r') rateLimit = parseInt(args[++i]);
+    else if (args[i] === '--max-body' || args[i] === '-b') maxBodyBytes = parseInt(args[++i]);
   }
 
-  start(port, dataDir, { apiToken, rateLimit });
+  start(port, dataDir, { apiToken, rateLimit, maxBodyBytes });
 }
 
 module.exports = { start };

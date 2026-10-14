@@ -155,6 +155,46 @@ describe('API Server (standalone)', () => {
     assert.strictEqual(status, 204);
   });
 
+  it('GET /health returns an unauthenticated liveness report', async () => {
+    const { status, body } = await get(`http://localhost:${port}/health`);
+    assert.strictEqual(status, 200);
+    assert.strictEqual(body.status, 'ok');
+    assert.strictEqual(body.chainValid, true);
+    assert.strictEqual(body.blocks, 2);
+    assert.ok(typeof body.uptime === 'number');
+    assert.ok(typeof body.timestamp === 'number');
+    assert.ok(body.latestBlock);
+    assert.ok(body.version);
+  });
+
+  it('GET /api/health is an alias for /health', async () => {
+    const { status, body } = await get(`http://localhost:${port}/api/health`);
+    assert.strictEqual(status, 200);
+    assert.strictEqual(body.status, 'ok');
+  });
+
+  it('health check is reachable even when API auth is configured', async () => {
+    const authDir = tempDir();
+    const Blockchain = require('../lib/chain');
+    const chain = new Blockchain(authDir);
+    const kp = crypto.generateKeypair();
+    const addr = crypto.addressFromPublicKey(kp.publicKey);
+    chain.mineBlock(addr);
+
+    const authServer = start(45904, authDir, { apiToken: 'secret-token' });
+    try {
+      const health = await get(`http://localhost:45904/health`);
+      assert.strictEqual(health.status, 200);
+      assert.strictEqual(health.body.status, 'ok');
+
+      const protectedRoute = await get(`http://localhost:45904/api/info`);
+      assert.strictEqual(protectedRoute.status, 401);
+    } finally {
+      authServer.close();
+      fs.rmSync(authDir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects requests without a bearer token when API auth is configured', async () => {
     const authDir = tempDir();
     const Blockchain = require('../lib/chain');
@@ -174,5 +214,57 @@ describe('API Server (standalone)', () => {
       authServer.close();
       fs.rmSync(authDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('API Server body size limit', () => {
+  let dir, server, port;
+  const maxBodyBytes = 256;
+
+  before(() => {
+    dir = tempDir();
+    const Blockchain = require('../lib/chain');
+    const chain = new Blockchain(dir);
+    const kp = crypto.generateKeypair();
+    const addr = crypto.addressFromPublicKey(kp.publicKey);
+    chain.mineBlock(addr);
+    port = 45905;
+    server = start(port, dir, { maxBodyBytes });
+  });
+
+  after(() => {
+    server.close();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('rejects an oversized POST body with 413', async () => {
+    const oversized = { base64: 'A'.repeat(maxBodyBytes * 4) };
+    const { status, body } = await post(`http://localhost:${port}/api/tx/decode`, oversized);
+    assert.strictEqual(status, 413);
+    assert.match(body.error, /too large/i);
+  });
+
+  it('still accepts request bodies within the limit', async () => {
+    const { status } = await post(`http://localhost:${port}/api/tx/decode`, { base64: 'invalid' });
+    assert.notStrictEqual(status, 413);
+    assert.strictEqual(status, 400);
+  });
+
+  it('rejects an oversized chunked body without a Content-Length header', async () => {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request(`http://localhost:${port}/api/tx/decode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      });
+      req.on('error', reject);
+      req.write('{"base64":"');
+      req.write('A'.repeat(maxBodyBytes * 4));
+      req.write('"}');
+      req.end();
+    });
+    assert.strictEqual(status, 413);
   });
 });

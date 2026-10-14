@@ -35,6 +35,7 @@ The suite verifies:
 - chain persistence and replacement behavior
 - wallet file safety and encrypted keystore handling
 - API request and error handling
+- oversized API request bodies are rejected with 413 rather than buffered
 - node-level limits for peer and message abuse
 - peer metadata and communication logic
 
