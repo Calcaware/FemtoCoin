@@ -78,7 +78,9 @@ The project now includes a few security defaults for safer use:
 
 - Wallet names are validated before file access to prevent path traversal.
 - API bearer-token support can be enabled with FEMTOCHAIN_API_TOKEN.
-- API rate limiting can be configured with FEMTOCHAIN_API_RATE_LIMIT.
+- API rate limiting can be configured with FEMTOCHAIN_API_RATE_LIMIT (set it to 0 to disable it).
+- Rate-limit state is bounded. Expired per-client buckets are swept regularly and the store is capped by FEMTOCHAIN_API_RATE_LIMIT_MAX_CLIENTS (default 10000) with least-recently-used eviction, so a large or spoofed address space cannot grow it without bound.
+- CORS responses only trust exact `localhost` and `127.0.0.1` origins by default; anything else receives an opaque `null` origin. Widen it with FEMTOCHAIN_CORS_ORIGIN, which accepts a comma-separated list of allowed origins.
 - API request bodies are capped (default 1 MiB, configurable with FEMTOCHAIN_API_MAX_BODY) and oversized requests get a `413 Payload Too Large` response instead of being buffered in memory.
 - HTTP server timeouts (`headersTimeout`, `requestTimeout`, `keepAliveTimeout`) are configurable and protect against slowloris-style connection exhaustion. See `FEMTOCHAIN_API_HEADERS_TIMEOUT`, `FEMTOCHAIN_API_REQUEST_TIMEOUT`, `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT`, and `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL`.
 - Peer and payload limits are enforced in the node layer.
@@ -104,16 +106,27 @@ lib/
   wallet.js        Key pair persistence with optional scrypt + AES-256-GCM encryption
   peer.js          WebSocket peer connection wrapper
   node.js          P2P node, networking, mempool, bootstrap, event-driven broadcast
-  api.js           REST API server (HTTP JSON endpoints)
+  api.js           Legacy REST API server, kept for reference and not loaded by anything
+server/
+  api.js           Active REST API server (HTTP JSON endpoints, auth, rate limiting)
 proto/
   blockchain.proto Protocol Buffers schema for Transaction, Block, and Chain messages
 test/
   crypto.test.js   Unit tests for hashing, key generation, signing, verification
+  unit.test.js     Unit tests for unit conversion and bigint formatting
   transaction.test.js  Unit tests for creation, signing, protobuf roundtrip, validation
   block.test.js    Unit tests for mining, protobuf roundtrip, PoW validation, size limits
   chain.test.js    Unit tests for block addition, state management, persistence, replacement
   wallet.test.js   Unit tests for save/load, encrypted keystore, wrong password rejection
-  api.test.js      Integration tests for REST API endpoints
+  node.test.js     Unit tests for peer handling, mempool rules, node limits
+  peer.test.js     Unit tests for peer connection metadata and message handling
+  api.test.js      Integration tests for REST API endpoints, rate limiting, CORS
+src/
+  crypto.ts        TypeScript port of the hashing and signature primitives
+  transaction.ts   TypeScript transaction model
+  block.ts         TypeScript block model with PoW mining
+  chain.ts         TypeScript blockchain state machine
+  unit.ts          TypeScript unit conversion utilities
 index.js           Interactive CLI entry point
 Dockerfile         Multi-stage Docker build with dumb-init
 docker-compose.yml 3-node cluster for local testing

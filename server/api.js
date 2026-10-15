@@ -14,45 +14,107 @@ const DEFAULT_HEADERS_TIMEOUT_MS = 60 * 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 5 * 1000;
 const DEFAULT_CONNECTIONS_CHECK_INTERVAL_MS = 30 * 1000;
+const DEFAULT_RATE_LIMIT_MAX_CLIENTS = 10000;
+const DEFAULT_RATE_LIMIT_SWEEP_MS = 30 * 1000;
 
-const RATE_LIMIT_STORE = new Map();
+// Coerces a configured value into a positive whole number, falling back to a
+// safe default when the value is missing or invalid.
+function resolvePositiveInt(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
 
-function getCorsOrigin(req) {
-  const configured = process.env.FEMTOCHAIN_CORS_ORIGIN || '';
-  if (configured) return configured;
+// Per-client rate limit buckets in a fixed window. The store is bounded: stale
+// buckets are swept once their window has passed and, when the cap is hit, the
+// least recently used client is dropped. Without both bounds a large or spoofed
+// address space could grow the map forever and exhaust memory.
+function createRateLimiter(options = {}) {
+  const windowMs = resolvePositiveInt(options.windowMs, RATE_LIMIT_WINDOW_MS);
+  const maxClients = resolvePositiveInt(options.maxClients, DEFAULT_RATE_LIMIT_MAX_CLIENTS);
+  const sweepIntervalMs = resolvePositiveInt(options.sweepIntervalMs, DEFAULT_RATE_LIMIT_SWEEP_MS);
+  const store = new Map();
+  let lastSweepAt = 0;
 
-  const origin = req.headers.origin;
-  if (!origin) return '*';
-
-  const allowList = ['http://localhost', 'http://127.0.0.1'];
-  if (allowList.some(prefix => origin.startsWith(prefix))) {
-    return origin;
+  function sweep(now) {
+    for (const [client, bucket] of store) {
+      if (now - bucket.start > windowMs) store.delete(client);
+    }
+    lastSweepAt = now;
   }
 
-  return 'null';
+  // Records one request for a client and reports whether it is over the limit.
+  function check(client, limit, now = Date.now()) {
+    // Sweeping is throttled so a burst of requests cannot turn every call into
+    // a full scan of the store. Memory stays bounded by maxClients regardless.
+    if (now - lastSweepAt >= sweepIntervalMs) sweep(now);
+
+    let bucket = store.get(client);
+    if (bucket && now - bucket.start > windowMs) bucket = null;
+
+    if (bucket) {
+      // Re-insert so insertion order doubles as least-recently-used order.
+      store.delete(client);
+    } else {
+      bucket = { count: 0, start: now };
+    }
+
+    bucket.count += 1;
+    store.set(client, bucket);
+
+    while (store.size > maxClients) {
+      store.delete(store.keys().next().value);
+    }
+
+    return bucket.count > limit;
+  }
+
+  return {
+    check,
+    get size() { return store.size; },
+    get maxClients() { return maxClients; }
+  };
+}
+
+// Trust only exact local hostnames. A plain prefix match would also accept
+// lookalike hosts such as http://localhost.attacker.example.
+function isLocalOrigin(origin) {
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch (_) {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  return parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+}
+
+function getCorsOrigin(req) {
+  const configured = (process.env.FEMTOCHAIN_CORS_ORIGIN || '').trim();
+  const allowed = configured ? configured.split(',').map(entry => entry.trim()).filter(Boolean) : [];
+  const origin = req.headers.origin;
+
+  if (allowed.length > 0) {
+    if (!origin) return allowed[0];
+    // Echoing back only an exact match keeps the header valid; anything else
+    // gets an opaque origin so the browser rejects the response.
+    return allowed.includes(origin) ? origin : 'null';
+  }
+
+  if (!origin) return '*';
+  return isLocalOrigin(origin) ? origin : 'null';
 }
 
 function getAuthToken() {
   return process.env.FEMTOCHAIN_API_TOKEN || '';
 }
 
-function enforceRateLimit(req, res, limit) {
-  const maxRequests = Number(limit || MAX_REQUESTS_PER_MINUTE);
-  if (maxRequests <= 0) return false;
+function enforceRateLimit(req, res, limit, limiter) {
+  const maxRequests = Number(limit ?? MAX_REQUESTS_PER_MINUTE);
+  if (!Number.isFinite(maxRequests) || maxRequests <= 0) return false;
 
   const ip = req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  const bucket = RATE_LIMIT_STORE.get(ip) || { count: 0, start: now };
-
-  if (now - bucket.start > RATE_LIMIT_WINDOW_MS) {
-    bucket.count = 0;
-    bucket.start = now;
-  }
-
-  bucket.count += 1;
-  RATE_LIMIT_STORE.set(ip, bucket);
-
-  if (bucket.count > maxRequests) {
+  const overLimit = limiter.check(ip, maxRequests);
+  if (overLimit) {
     res.writeHead(429, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Rate limit exceeded' }) + '\n');
     return true;
@@ -108,9 +170,18 @@ function applyServerTimeouts(server, timeouts = {}) {
 function start(port, dataDir, options = {}) {
   const chain = new Blockchain(dataDir);
   const apiToken = options.apiToken || process.env.FEMTOCHAIN_API_TOKEN || '';
-  const rateLimit = options.rateLimit || Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
+  const rateLimit = options.rateLimit ?? Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
   const maxBodyBytes = options.maxBodyBytes || MAX_BODY_BYTES;
-  const server = http.createServer((req, res) => handle(req, res, chain, port, apiToken, rateLimit, maxBodyBytes));
+  const rateLimiter = createRateLimiter({
+    maxClients:
+      options.rateLimitMaxClients ?? process.env.FEMTOCHAIN_API_RATE_LIMIT_MAX_CLIENTS,
+    windowMs: options.rateLimitWindowMs
+  });
+  const server = http.createServer((req, res) =>
+    handle(req, res, chain, port, apiToken, rateLimit, maxBodyBytes, rateLimiter));
+  // Exposed for introspection and tests; the limiter owns the bounded bucket
+  // store for this server only.
+  server.rateLimiter = rateLimiter;
   applyServerTimeouts(server, {
     headersTimeout: options.headersTimeout ?? process.env.FEMTOCHAIN_API_HEADERS_TIMEOUT,
     requestTimeout: options.requestTimeout ?? process.env.FEMTOCHAIN_API_REQUEST_TIMEOUT,
@@ -124,7 +195,7 @@ function start(port, dataDir, options = {}) {
   return server;
 }
 
-function handle(req, res, chain, listenPort, apiToken, rateLimit, maxBodyBytes = MAX_BODY_BYTES) {
+function handle(req, res, chain, listenPort, apiToken, rateLimit, maxBodyBytes = MAX_BODY_BYTES, rateLimiter) {
   const origin = getCorsOrigin(req);
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -151,8 +222,9 @@ function handle(req, res, chain, listenPort, apiToken, rateLimit, maxBodyBytes =
     if (authBlocked) return;
   }
 
-  const currentLimit = Number(rateLimit || MAX_REQUESTS_PER_MINUTE);
-  if (currentLimit > 0 && enforceRateLimit(req, res, currentLimit)) {
+  const currentLimit = Number(rateLimit ?? MAX_REQUESTS_PER_MINUTE);
+  if (Number.isFinite(currentLimit) && currentLimit > 0 &&
+      enforceRateLimit(req, res, currentLimit, rateLimiter)) {
     return;
   }
 
@@ -351,6 +423,7 @@ if (require.main === module) {
   let dataDir = DATA_DIR;
   let apiToken = process.env.FEMTOCHAIN_API_TOKEN || '';
   let rateLimit = Number(process.env.FEMTOCHAIN_API_RATE_LIMIT || 120);
+  let rateLimitMaxClients = process.env.FEMTOCHAIN_API_RATE_LIMIT_MAX_CLIENTS;
   let maxBodyBytes = Number(process.env.FEMTOCHAIN_API_MAX_BODY || DEFAULT_MAX_BODY_BYTES);
   let headersTimeout = process.env.FEMTOCHAIN_API_HEADERS_TIMEOUT;
   let requestTimeout = process.env.FEMTOCHAIN_API_REQUEST_TIMEOUT;
@@ -362,6 +435,7 @@ if (require.main === module) {
     else if (args[i] === '--data-dir' || args[i] === '-d') dataDir = args[++i];
     else if (args[i] === '--auth-token' || args[i] === '-t') apiToken = args[++i];
     else if (args[i] === '--rate-limit' || args[i] === '-r') rateLimit = parseInt(args[++i]);
+    else if (args[i] === '--rate-limit-clients') rateLimitMaxClients = parseInt(args[++i]);
     else if (args[i] === '--max-body' || args[i] === '-b') maxBodyBytes = parseInt(args[++i]);
     else if (args[i] === '--headers-timeout') headersTimeout = parseInt(args[++i]);
     else if (args[i] === '--request-timeout') requestTimeout = parseInt(args[++i]);
@@ -370,9 +444,9 @@ if (require.main === module) {
   }
 
   start(port, dataDir, {
-    apiToken, rateLimit, maxBodyBytes,
+    apiToken, rateLimit, rateLimitMaxClients, maxBodyBytes,
     headersTimeout, requestTimeout, keepAliveTimeout, connectionsCheckingInterval
   });
 }
 
-module.exports = { start, applyServerTimeouts };
+module.exports = { start, applyServerTimeouts, createRateLimiter };

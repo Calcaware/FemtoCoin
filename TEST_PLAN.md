@@ -13,7 +13,7 @@ Core modules
 - lib/wallet.js: wallet creation, encrypted keystore behavior, input validation
 - lib/node.js: peer communication, mempool handling, peer limits
 - lib/peer.js: socket metadata and message send semantics
-- server/api.js: HTTP API behavior and auth enforcement
+- server/api.js: HTTP API behavior, auth enforcement, rate limiting, CORS
 
 Test files
 ----------
@@ -37,6 +37,9 @@ The suite verifies:
 - API request and error handling
 - oversized API request bodies are rejected with 413 rather than buffered
 - HTTP header/request/keep-alive timeouts are configured and stalled clients are dropped
+- rate limit buckets are swept when they expire and evicted once the client cap is hit
+- each server instance keeps its own rate limit store
+- CORS responses only trust configured or exact local origins
 - node-level limits for peer and message abuse
 - peer metadata and communication logic
 

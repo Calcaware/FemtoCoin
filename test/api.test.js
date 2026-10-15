@@ -4,7 +4,7 @@ const http = require('http');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
-const { start, applyServerTimeouts } = require('../server/api');
+const { start, applyServerTimeouts, createRateLimiter } = require('../server/api');
 const crypto = require('../lib/crypto');
 const { COIN } = require('../lib/unit');
 
@@ -44,6 +44,34 @@ function post(url, body) {
     req.write(payload);
     req.end();
   });
+}
+
+// Performs a request and reports the CORS origin the server answered with,
+// which is what browser clients use to decide whether a response is readable.
+function getOrigin(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { headers }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        allowOrigin: res.headers['access-control-allow-origin']
+      }));
+    });
+    req.on('error', reject);
+  });
+}
+
+function closeServer(server) {
+  return new Promise((resolve) => server.close(resolve));
+}
+
+// Starts a server on an ephemeral port and resolves once it is accepting
+// connections, so tests never race the listener setup.
+async function startOnEphemeralPort(options = {}) {
+  const dir = tempDir();
+  const server = start(0, dir, options);
+  await new Promise((resolve) => server.once('listening', resolve));
+  return { server, dir, port: server.address().port };
 }
 
 describe('API Server (standalone)', () => {
@@ -271,10 +299,6 @@ describe('API Server body size limit', () => {
 });
 
 describe('API Server HTTP timeouts', () => {
-  function closeServer(server) {
-    return new Promise((resolve) => server.close(resolve));
-  }
-
   it('applies configurable socket timeouts to the server', async () => {
     const dir = tempDir();
     const server = start(0, dir, { headersTimeout: 25000, requestTimeout: 90000, keepAliveTimeout: 3000 });
@@ -330,6 +354,194 @@ describe('API Server HTTP timeouts', () => {
       });
       assert.strictEqual(outcome, 'closed');
     } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('API rate limit store', () => {
+  const T0 = 1700000000000;
+
+  it('sweeps buckets whose window has expired', () => {
+    const limiter = createRateLimiter({ windowMs: 1000, sweepIntervalMs: 1, maxClients: 100 });
+    limiter.check('10.0.0.1', 5, T0);
+    limiter.check('10.0.0.2', 5, T0);
+    assert.strictEqual(limiter.size, 2);
+
+    limiter.check('10.0.0.3', 5, T0 + 5000);
+    assert.strictEqual(limiter.size, 1);
+  });
+
+  it('keeps counting requests inside the window and resets afterwards', () => {
+    const limiter = createRateLimiter({ windowMs: 1000, sweepIntervalMs: 1, maxClients: 100 });
+    assert.strictEqual(limiter.check('10.0.0.1', 3, T0), false);
+    assert.strictEqual(limiter.check('10.0.0.1', 3, T0 + 100), false);
+    assert.strictEqual(limiter.check('10.0.0.1', 3, T0 + 200), false);
+    // The fourth request inside the window pushes the client over the limit.
+    assert.strictEqual(limiter.check('10.0.0.1', 3, T0 + 300), true);
+    // The bucket expired, so the client starts a fresh window.
+    assert.strictEqual(limiter.check('10.0.0.1', 3, T0 + 5000), false);
+    assert.strictEqual(limiter.size, 1);
+  });
+
+  it('never grows past the configured client cap', () => {
+    const limiter = createRateLimiter({ maxClients: 8, sweepIntervalMs: 60000 });
+    for (let i = 0; i < 500; i++) {
+      limiter.check(`192.168.${Math.floor(i / 256)}.${i % 256}`, 5, T0 + i);
+    }
+    assert.strictEqual(limiter.maxClients, 8);
+    assert.strictEqual(limiter.size, 8);
+  });
+
+  it('evicts idle clients before active ones', () => {
+    const limiter = createRateLimiter({ maxClients: 3, sweepIntervalMs: 60000 });
+    assert.strictEqual(limiter.check('steady', 5, T0), false);
+
+    for (let i = 0; i < 100; i++) {
+      limiter.check('steady', 1000, T0 + 10 + i);
+      limiter.check(`churn-${i}`, 1000, T0 + 10 + i);
+    }
+    assert.ok(limiter.size <= 3);
+
+    // A still lower limit only trips if the steady bucket survived the churn,
+    // because an evicted bucket would come back empty.
+    assert.strictEqual(limiter.check('steady', 5, T0 + 5000), true);
+  });
+
+  it('falls back to defaults for invalid configuration', () => {
+    const limiter = createRateLimiter({ maxClients: 0, windowMs: -5, sweepIntervalMs: 'abc' });
+    assert.ok(limiter.maxClients > 0);
+    limiter.check('10.0.0.1', 1, T0);
+    assert.strictEqual(limiter.size, 1);
+  });
+});
+
+describe('API Server rate limiting', () => {
+  it('answers 429 once the client exceeds the configured limit', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({ rateLimit: 3 });
+    try {
+      const statuses = [];
+      for (let i = 0; i < 5; i++) {
+        statuses.push((await get(`http://127.0.0.1:${port}/api/info`)).status);
+      }
+      assert.deepStrictEqual(statuses, [200, 200, 200, 429, 429]);
+
+      // Health probes stay reachable while the client is throttled.
+      const health = await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(health.status, 200);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not throttle when the limit is 0', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({ rateLimit: 0 });
+    try {
+      for (let i = 0; i < 5; i++) {
+        const { status } = await get(`http://127.0.0.1:${port}/api/info`);
+        assert.strictEqual(status, 200);
+      }
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a separate store per server instance', async () => {
+    const first = await startOnEphemeralPort({ rateLimit: 1 });
+    const second = await startOnEphemeralPort({ rateLimit: 1 });
+    try {
+      const a = await get(`http://127.0.0.1:${first.port}/api/info`);
+      const aAgain = await get(`http://127.0.0.1:${first.port}/api/info`);
+      const b = await get(`http://127.0.0.1:${second.port}/api/info`);
+      assert.strictEqual(a.status, 200);
+      assert.strictEqual(aAgain.status, 429);
+      assert.strictEqual(b.status, 200);
+    } finally {
+      await closeServer(first.server);
+      await closeServer(second.server);
+      fs.rmSync(first.dir, { recursive: true, force: true });
+      fs.rmSync(second.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('applies the configured client cap to the server store', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({
+      rateLimit: 1000,
+      rateLimitMaxClients: 4
+    });
+    try {
+      assert.strictEqual(server.rateLimiter.maxClients, 4);
+      for (let i = 0; i < 50; i++) {
+        server.rateLimiter.check(`10.1.${Math.floor(i / 256)}.${i % 256}`, 5);
+      }
+      assert.strictEqual(server.rateLimiter.size, 4);
+
+      const { status } = await get(`http://127.0.0.1:${port}/api/info`);
+      assert.strictEqual(status, 200);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('API Server CORS origins', () => {
+  it('trusts exact local origins and rejects lookalike hosts', async () => {
+    const { server, dir, port } = await startOnEphemeralPort();
+    const base = `http://127.0.0.1:${port}/api/info`;
+    try {
+      const local = await getOrigin(base, { Origin: 'http://localhost:3000' });
+      assert.strictEqual(local.allowOrigin, 'http://localhost:3000');
+
+      const loopback = await getOrigin(base, { Origin: 'http://127.0.0.1:8080' });
+      assert.strictEqual(loopback.allowOrigin, 'http://127.0.0.1:8080');
+
+      const lookalike = await getOrigin(base, { Origin: 'http://localhost.attacker.example' });
+      assert.strictEqual(lookalike.allowOrigin, 'null');
+
+      const foreign = await getOrigin(base, { Origin: 'https://evil.example' });
+      assert.strictEqual(foreign.allowOrigin, 'null');
+
+      const none = await getOrigin(base);
+      assert.strictEqual(none.allowOrigin, '*');
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('honors a comma-separated origin allowlist', async () => {
+    const { server, dir, port } = await startOnEphemeralPort();
+    const base = `http://127.0.0.1:${port}/api/info`;
+    process.env.FEMTOCHAIN_CORS_ORIGIN = 'http://localhost:3000, https://app.example';
+    try {
+      const allowed = await getOrigin(base, { Origin: 'https://app.example' });
+      assert.strictEqual(allowed.allowOrigin, 'https://app.example');
+
+      const denied = await getOrigin(base, { Origin: 'https://attacker.example' });
+      assert.strictEqual(denied.allowOrigin, 'null');
+    } finally {
+      delete process.env.FEMTOCHAIN_CORS_ORIGIN;
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores an allowlist that only contains separators', async () => {
+    const { server, dir, port } = await startOnEphemeralPort();
+    const base = `http://127.0.0.1:${port}/api/info`;
+    process.env.FEMTOCHAIN_CORS_ORIGIN = ' , ';
+    try {
+      const none = await getOrigin(base);
+      assert.strictEqual(none.allowOrigin, '*');
+
+      const local = await getOrigin(base, { Origin: 'http://localhost:3000' });
+      assert.strictEqual(local.allowOrigin, 'http://localhost:3000');
+    } finally {
+      delete process.env.FEMTOCHAIN_CORS_ORIGIN;
       await closeServer(server);
       fs.rmSync(dir, { recursive: true, force: true });
     }
