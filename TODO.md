@@ -11,6 +11,7 @@
 - ✅ Health/status endpoint implemented (`GET /health`)
 - ✅ API request body size capped (`413 Payload Too Large`)
 - ✅ HTTP server timeouts implemented (slowloris protection)
+- ✅ Health check verdicts are cached briefly so probe floods cannot burn CPU on chain validation
 
 ## Phase 1: Completed ✅
 - [x] Upgrade protobufjs to patched version (8.8.0+)
@@ -33,7 +34,8 @@
 - [ ] **Add structured logging** - Replace console.log with structured logging (levels, timestamps, context) for better observability
 - [ ] **Add metrics collection** - Track blocks mined, peer counts, rejected messages, validation failures, mempool size
 - [x] **Add health check endpoint** - Lightweight health/status endpoint for monitoring and load balancers (`GET /health`, `GET /api/health`)
-- [ ] **Cache health check results** - `GET /health` runs `chain.isValid()` on every unauthenticated probe, and that check walks the whole chain, so a flood of cheap probes can still burn CPU. Cache the verdict for a short interval or revalidate in the background instead of validating per request
+- [x] **Cache health check results** - `GET /health` no longer walks the whole chain on every unauthenticated probe. `createHealthCache()` in `server/api.js` holds the chain-derived verdict (validity, height, latest hash) for a short TTL (default 1000 ms, `FEMTOCHAIN_API_HEALTH_TTL` or `--health-ttl`, 0 disables caching), while `uptime` and `timestamp` are still produced per request. The cache lives on the server instance as `server.healthCache` and exposes `reset()` for forced revalidation.
+- [ ] **Revalidate health checks in the background** - The health cache still runs `chain.isValid()` on the request path once the TTL expires, so the probe that refreshes it pays the full chain walk. Refresh the verdict from a timer instead and let probes read the last known result, so request latency never depends on chain length.
 - [ ] **Harden Docker containers** - Run as non-root user, add HEALTHCHECK in Dockerfile, proper volume permissions
 - [ ] **Improve error handling** - Consistent error reporting and graceful degradation across modules
 
@@ -104,6 +106,7 @@ Key environment variables for hardened deployments:
 - `FEMTOCHAIN_API_REQUEST_TIMEOUT` - Milliseconds allowed for the whole request (default 300000)
 - `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT` - Milliseconds an idle keep-alive socket is retained (default 5000)
 - `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL` - Milliseconds between timeout sweeps of open connections (default 30000)
+- `FEMTOCHAIN_API_HEALTH_TTL` - Milliseconds a health check verdict is cached before revalidating the chain (default 1000, set to 0 to disable caching)
 - `FEMTOCHAIN_CORS_ORIGIN` - Allowed CORS origins (comma-separated)
 - `FEMTOCHAIN_SECURE_WALLETS` - Require encrypted wallets by default (1/0)
 - `FEMTOCHAIN_MAX_PEERS` - Maximum concurrent peer connections

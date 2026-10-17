@@ -4,7 +4,7 @@ const http = require('http');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
-const { start, applyServerTimeouts, createRateLimiter } = require('../server/api');
+const { start, applyServerTimeouts, createRateLimiter, createHealthCache } = require('../server/api');
 const crypto = require('../lib/crypto');
 const { COIN } = require('../lib/unit');
 
@@ -353,6 +353,100 @@ describe('API Server HTTP timeouts', () => {
         socket.on('error', () => { clearTimeout(timer); resolve('closed'); });
       });
       assert.strictEqual(outcome, 'closed');
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('API health cache', () => {
+  const T0 = 1700000000000;
+
+  it('reuses the verdict within the TTL and recomputes afterwards', () => {
+    const cache = createHealthCache({ ttlMs: 1000 });
+    let calls = 0;
+    const compute = () => { calls += 1; return { chainValid: true }; };
+
+    const first = cache.read(compute, T0);
+    assert.strictEqual(cache.read(compute, T0 + 500), first);
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(cache.validations, 1);
+
+    cache.read(compute, T0 + 1500);
+    assert.strictEqual(calls, 2);
+  });
+
+  it('recomputes on every read when the TTL is zero', () => {
+    const cache = createHealthCache({ ttlMs: 0 });
+    let calls = 0;
+    const compute = () => { calls += 1; return calls; };
+    assert.strictEqual(cache.read(compute, T0), 1);
+    assert.strictEqual(cache.read(compute, T0), 2);
+    assert.strictEqual(cache.validations, 2);
+  });
+
+  it('drops the cached verdict when reset', () => {
+    const cache = createHealthCache({ ttlMs: 60000 });
+    let calls = 0;
+    const compute = () => { calls += 1; return calls; };
+    cache.read(compute, T0);
+    cache.reset();
+    cache.read(compute, T0 + 1);
+    assert.strictEqual(calls, 2);
+  });
+
+  it('falls back to a positive default TTL for invalid values', () => {
+    assert.ok(createHealthCache({ ttlMs: 'abc' }).ttlMs > 0);
+    assert.ok(createHealthCache({ ttlMs: -10 }).ttlMs > 0);
+  });
+});
+
+describe('API Server health caching', () => {
+  it('validates the chain once for probes inside the TTL', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 60000 });
+    try {
+      const first = await get(`http://127.0.0.1:${port}/health`);
+      const second = await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(first.status, 200);
+      assert.strictEqual(second.status, 200);
+      assert.strictEqual(first.body.chainValid, true);
+      assert.strictEqual(second.body.blocks, first.body.blocks);
+      assert.strictEqual(server.healthCache.validations, 1);
+
+      // Cached chain data must not freeze the per-request fields.
+      assert.ok(Math.abs(Date.now() - second.body.timestamp) < 2000);
+      assert.ok(typeof second.body.uptime === 'number');
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('revalidates once the TTL expires', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 50 });
+    try {
+      await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(server.healthCache.validations, 1);
+
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(server.healthCache.validations, 2);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('revalidates every probe when the TTL is disabled', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 0 });
+    try {
+      assert.strictEqual(server.healthCache.ttlMs, 0);
+      for (let i = 0; i < 3; i++) {
+        const { status } = await get(`http://127.0.0.1:${port}/health`);
+        assert.strictEqual(status, 200);
+      }
+      assert.strictEqual(server.healthCache.validations, 3);
     } finally {
       await closeServer(server);
       fs.rmSync(dir, { recursive: true, force: true });

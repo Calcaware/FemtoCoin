@@ -16,12 +16,20 @@ const DEFAULT_KEEPALIVE_TIMEOUT_MS = 5 * 1000;
 const DEFAULT_CONNECTIONS_CHECK_INTERVAL_MS = 30 * 1000;
 const DEFAULT_RATE_LIMIT_MAX_CLIENTS = 10000;
 const DEFAULT_RATE_LIMIT_SWEEP_MS = 30 * 1000;
+const DEFAULT_HEALTH_TTL_MS = 1000;
 
 // Coerces a configured value into a positive whole number, falling back to a
 // safe default when the value is missing or invalid.
 function resolvePositiveInt(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+// Coerces a configured duration into a whole number of milliseconds. Zero is a
+// valid value here and means "no caching", so the caller revalidates every time.
+function resolveDuration(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
 }
 
 // Per-client rate limit buckets in a fixed window. The store is bounded: stale
@@ -72,6 +80,40 @@ function createRateLimiter(options = {}) {
     check,
     get size() { return store.size; },
     get maxClients() { return maxClients; }
+  };
+}
+
+// Health probes are cheap to send but expensive to answer: the readiness check
+// walks every block of the chain. This holds the chain-derived part of the
+// verdict for a short window so a burst of unauthenticated probes reuses one
+// result instead of revalidating the chain on each request. Per-request fields
+// such as uptime and timestamp are still produced fresh by the caller.
+function createHealthCache(options = {}) {
+  const ttlMs = resolveDuration(options.ttlMs, DEFAULT_HEALTH_TTL_MS);
+  let entry = null;
+  let validations = 0;
+
+  // Returns the cached value while it is younger than the TTL, otherwise calls
+  // compute() once and stores the result.
+  function read(compute, now = Date.now()) {
+    if (entry && now - entry.at < ttlMs) return entry.value;
+    const value = compute();
+    entry = { value, at: now };
+    validations += 1;
+    return value;
+  }
+
+  // Drops the cached verdict so the next read revalidates the chain. Useful
+  // after a state change that should be reflected immediately.
+  function reset() {
+    entry = null;
+  }
+
+  return {
+    read,
+    reset,
+    get ttlMs() { return ttlMs; },
+    get validations() { return validations; }
   };
 }
 
@@ -177,11 +219,15 @@ function start(port, dataDir, options = {}) {
       options.rateLimitMaxClients ?? process.env.FEMTOCHAIN_API_RATE_LIMIT_MAX_CLIENTS,
     windowMs: options.rateLimitWindowMs
   });
+  const healthCache = createHealthCache({
+    ttlMs: options.healthTtl ?? process.env.FEMTOCHAIN_API_HEALTH_TTL
+  });
   const server = http.createServer((req, res) =>
-    handle(req, res, chain, port, apiToken, rateLimit, maxBodyBytes, rateLimiter));
-  // Exposed for introspection and tests; the limiter owns the bounded bucket
-  // store for this server only.
+    handle(req, res, { chain, port, apiToken, rateLimit, maxBodyBytes, rateLimiter, healthCache }));
+  // Exposed for introspection and tests; the limiter stores its buckets per
+  // server and the health cache holds this server's cached readiness verdict.
   server.rateLimiter = rateLimiter;
+  server.healthCache = healthCache;
   applyServerTimeouts(server, {
     headersTimeout: options.headersTimeout ?? process.env.FEMTOCHAIN_API_HEADERS_TIMEOUT,
     requestTimeout: options.requestTimeout ?? process.env.FEMTOCHAIN_API_REQUEST_TIMEOUT,
@@ -195,7 +241,11 @@ function start(port, dataDir, options = {}) {
   return server;
 }
 
-function handle(req, res, chain, listenPort, apiToken, rateLimit, maxBodyBytes = MAX_BODY_BYTES, rateLimiter) {
+function handle(req, res, context) {
+  const {
+    chain, port, apiToken, rateLimit,
+    maxBodyBytes = MAX_BODY_BYTES, rateLimiter, healthCache
+  } = context;
   const origin = getCorsOrigin(req);
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -207,13 +257,13 @@ function handle(req, res, chain, listenPort, apiToken, rateLimit, maxBodyBytes =
     return;
   }
 
-  const url = new URL(req.url, `http://localhost:${listenPort}`);
+  const url = new URL(req.url, `http://localhost:${port}`);
   const path = url.pathname.replace(/\/+$/, '') || '/';
 
   // Health checks are intentionally unauthenticated and exempt from rate
   // limiting so load balancers and monitoring probes can always reach them.
   if ((path === '/health' || path === '/api/health') && req.method === 'GET') {
-    return sendHealth(res, chain);
+    return sendHealth(res, chain, healthCache);
   }
 
   const configuredToken = apiToken || getAuthToken();
@@ -284,9 +334,9 @@ function bigintReplacer(key, value) {
   return value;
 }
 
-// Lightweight liveness/readiness probe. Returns 200 when the node's chain is
-// valid and 503 when it is not, so orchestrators can restart unhealthy nodes.
-function sendHealth(res, chain) {
+// Collects the chain-derived part of the readiness verdict. This is the
+// expensive half, so callers route it through the health cache.
+function readChainState(chain) {
   let chainValid = false;
   let blocks = 0;
   let latestHash = null;
@@ -298,18 +348,27 @@ function sendHealth(res, chain) {
   } catch (_) {
     chainValid = false;
   }
+  return { chainValid, blocks, latestHash };
+}
+
+// Lightweight liveness/readiness probe. Returns 200 when the node's chain is
+// valid and 503 when it is not, so orchestrators can restart unhealthy nodes.
+function sendHealth(res, chain, healthCache) {
+  const state = healthCache
+    ? healthCache.read(() => readChainState(chain))
+    : readChainState(chain);
 
   const body = {
-    status: chainValid ? 'ok' : 'unhealthy',
+    status: state.chainValid ? 'ok' : 'unhealthy',
     uptime: Math.floor(process.uptime()),
     timestamp: Date.now(),
-    blocks,
-    chainValid,
-    latestBlock: latestHash,
+    blocks: state.blocks,
+    chainValid: state.chainValid,
+    latestBlock: state.latestHash,
     version: PKG_VERSION || null
   };
 
-  res.writeHead(chainValid ? 200 : 503, { 'Content-Type': 'application/json' });
+  res.writeHead(state.chainValid ? 200 : 503, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body, bigintReplacer, 2) + '\n');
 }
 
@@ -429,6 +488,7 @@ if (require.main === module) {
   let requestTimeout = process.env.FEMTOCHAIN_API_REQUEST_TIMEOUT;
   let keepAliveTimeout = process.env.FEMTOCHAIN_API_KEEPALIVE_TIMEOUT;
   let connectionsCheckingInterval = process.env.FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL;
+  let healthTtl = process.env.FEMTOCHAIN_API_HEALTH_TTL;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' || args[i] === '-p') port = parseInt(args[++i]);
@@ -441,12 +501,14 @@ if (require.main === module) {
     else if (args[i] === '--request-timeout') requestTimeout = parseInt(args[++i]);
     else if (args[i] === '--keepalive-timeout') keepAliveTimeout = parseInt(args[++i]);
     else if (args[i] === '--check-interval') connectionsCheckingInterval = parseInt(args[++i]);
+    else if (args[i] === '--health-ttl') healthTtl = parseInt(args[++i]);
   }
 
   start(port, dataDir, {
     apiToken, rateLimit, rateLimitMaxClients, maxBodyBytes,
-    headersTimeout, requestTimeout, keepAliveTimeout, connectionsCheckingInterval
+    headersTimeout, requestTimeout, keepAliveTimeout, connectionsCheckingInterval,
+    healthTtl
   });
 }
 
-module.exports = { start, applyServerTimeouts, createRateLimiter };
+module.exports = { start, applyServerTimeouts, createRateLimiter, createHealthCache };

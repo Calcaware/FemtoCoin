@@ -85,6 +85,7 @@ The project now includes a few security defaults for safer use:
 - HTTP server timeouts (`headersTimeout`, `requestTimeout`, `keepAliveTimeout`) are configurable and protect against slowloris-style connection exhaustion. See `FEMTOCHAIN_API_HEADERS_TIMEOUT`, `FEMTOCHAIN_API_REQUEST_TIMEOUT`, `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT`, and `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL`.
 - Peer and payload limits are enforced in the node layer.
 - A health/readiness probe is exposed at `GET /health` (alias `GET /api/health`). It is unauthenticated and exempt from rate limiting so load balancers and orchestrators can always reach it, and it returns `503` when the chain fails validation.
+- The health probe caches its chain verdict for a short window (default 1 second, configurable with FEMTOCHAIN_API_HEALTH_TTL or `--health-ttl`, set it to 0 to revalidate on every request). A burst of probes reuses one result instead of walking the whole chain each time, while `uptime` and `timestamp` stay fresh on every response.
 - Dependency checks should run regularly with `npm audit`.
 
 Example:
