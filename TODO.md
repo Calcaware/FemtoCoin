@@ -1,7 +1,7 @@
 # TODO - FemtoCoin Project
 
 ## Project Status
-- ✅ All 126 tests pass
+- ✅ All 137 tests pass
 - ✅ TypeScript typecheck passes with strict mode
 - ✅ `npm audit` reports 0 vulnerabilities (protobufjs upgraded)
 - ✅ Phase 1 (hardening) from UPGRADE_PLAN.md is complete
@@ -11,7 +11,7 @@
 - ✅ Health/status endpoint implemented (`GET /health`)
 - ✅ API request body size capped (`413 Payload Too Large`)
 - ✅ HTTP server timeouts implemented (slowloris protection)
-- ✅ Health check verdicts are cached briefly so probe floods cannot burn CPU on chain validation
+- ✅ Health check verdicts are refreshed on a background timer, so probes never walk the chain
 
 ## Phase 1: Completed ✅
 - [x] Upgrade protobufjs to patched version (8.8.0+)
@@ -35,7 +35,8 @@
 - [ ] **Add metrics collection** - Track blocks mined, peer counts, rejected messages, validation failures, mempool size
 - [x] **Add health check endpoint** - Lightweight health/status endpoint for monitoring and load balancers (`GET /health`, `GET /api/health`)
 - [x] **Cache health check results** - `GET /health` no longer walks the whole chain on every unauthenticated probe. `createHealthCache()` in `server/api.js` holds the chain-derived verdict (validity, height, latest hash) for a short TTL (default 1000 ms, `FEMTOCHAIN_API_HEALTH_TTL` or `--health-ttl`, 0 disables caching), while `uptime` and `timestamp` are still produced per request. The cache lives on the server instance as `server.healthCache` and exposes `reset()` for forced revalidation.
-- [ ] **Revalidate health checks in the background** - The health cache still runs `chain.isValid()` on the request path once the TTL expires, so the probe that refreshes it pays the full chain walk. Refresh the verdict from a timer instead and let probes read the last known result, so request latency never depends on chain length.
+- [x] **Revalidate health checks in the background** - `createHealthCache()` in `server/api.js` now owns a refresh timer. It computes one verdict at startup and then refreshes it every `FEMTOCHAIN_API_HEALTH_TTL` milliseconds (default 1000, `--health-ttl`), while `GET /health` only reads the last result, so request latency no longer depends on chain length. The timer is stopped when the server closes, a producer failure is reported as an unhealthy chain instead of killing the timer, and a TTL of 0 still disables the timer and validates on every request. `reset()` revalidates immediately.
+- [ ] **Expose health cache freshness** - The background refresh hides chain walks from probes, but there is no telemetry for refresh duration or for how old the served verdict is. Record the last refresh time and duration and expose them in `GET /health` so a slow or stalled refresh is visible.
 - [ ] **Harden Docker containers** - Run as non-root user, add HEALTHCHECK in Dockerfile, proper volume permissions
 - [ ] **Improve error handling** - Consistent error reporting and graceful degradation across modules
 
@@ -106,7 +107,7 @@ Key environment variables for hardened deployments:
 - `FEMTOCHAIN_API_REQUEST_TIMEOUT` - Milliseconds allowed for the whole request (default 300000)
 - `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT` - Milliseconds an idle keep-alive socket is retained (default 5000)
 - `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL` - Milliseconds between timeout sweeps of open connections (default 30000)
-- `FEMTOCHAIN_API_HEALTH_TTL` - Milliseconds a health check verdict is cached before revalidating the chain (default 1000, set to 0 to disable caching)
+- `FEMTOCHAIN_API_HEALTH_TTL` - Milliseconds between background health refresh runs (default 1000, set to 0 to disable the timer and validate on every request)
 - `FEMTOCHAIN_CORS_ORIGIN` - Allowed CORS origins (comma-separated)
 - `FEMTOCHAIN_SECURE_WALLETS` - Require encrypted wallets by default (1/0)
 - `FEMTOCHAIN_MAX_PEERS` - Maximum concurrent peer connections

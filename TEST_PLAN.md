@@ -38,7 +38,8 @@ The suite verifies:
 - oversized API request bodies are rejected with 413 rather than buffered
 - HTTP header/request/keep-alive timeouts are configured and stalled clients are dropped
 - rate limit buckets are swept when they expire and evicted once the client cap is hit
-- health check verdicts are cached for the configured TTL and revalidated once it expires
+- health check verdicts are refreshed by a background timer, probes never walk the chain, and the timer stops when the server closes
+- setting the health refresh interval to 0 disables the timer and validates the chain on every probe
 - each server instance keeps its own rate limit store
 - CORS responses only trust configured or exact local origins
 - node-level limits for peer and message abuse

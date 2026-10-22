@@ -84,36 +84,74 @@ function createRateLimiter(options = {}) {
 }
 
 // Health probes are cheap to send but expensive to answer: the readiness check
-// walks every block of the chain. This holds the chain-derived part of the
-// verdict for a short window so a burst of unauthenticated probes reuses one
-// result instead of revalidating the chain on each request. Per-request fields
-// such as uptime and timestamp are still produced fresh by the caller.
+// walks every block of the chain. This keeps the chain-derived part of the
+// verdict fresh on a timer so probes only ever read the last result and request
+// latency does not grow with chain length. Per-request fields such as uptime
+// and timestamp are still produced fresh by the caller.
 function createHealthCache(options = {}) {
   const ttlMs = resolveDuration(options.ttlMs, DEFAULT_HEALTH_TTL_MS);
+  let producer = typeof options.compute === 'function' ? options.compute : null;
   let entry = null;
   let validations = 0;
+  let timer = null;
 
-  // Returns the cached value while it is younger than the TTL, otherwise calls
-  // compute() once and stores the result.
-  function read(compute, now = Date.now()) {
-    if (entry && now - entry.at < ttlMs) return entry.value;
-    const value = compute();
+  // Runs one validation and stores the result. A producer that throws is
+  // recorded as an unhealthy chain instead of taking the timer down with it.
+  function compute(now = Date.now()) {
+    if (!producer) return null;
+    let value;
+    try {
+      value = producer();
+    } catch (_) {
+      value = { chainValid: false, blocks: 0, latestHash: null };
+    }
     entry = { value, at: now };
     validations += 1;
     return value;
   }
 
-  // Drops the cached verdict so the next read revalidates the chain. Useful
-  // after a state change that should be reflected immediately.
+  // Starts the background refresh. The first verdict is computed immediately
+  // so a probe arriving before the first tick still gets a real answer. A TTL
+  // of zero disables the timer and keeps the on-demand behavior.
+  function start(computeFn) {
+    if (typeof computeFn === 'function') producer = computeFn;
+    if (ttlMs === 0 || timer || !producer) return;
+    compute();
+    timer = setInterval(() => compute(), ttlMs);
+    // The refresh timer should not keep the process alive on its own.
+    if (typeof timer.unref === 'function') timer.unref();
+  }
+
+  function stop() {
+    if (!timer) return;
+    clearInterval(timer);
+    timer = null;
+  }
+
+  // Returns the last known verdict. With caching disabled the chain is
+  // validated on demand instead, which is what a TTL of zero asks for.
+  function read(now = Date.now()) {
+    if (ttlMs === 0) return compute(now);
+    if (entry) return entry.value;
+    return compute(now);
+  }
+
+  // Drops the cached verdict. When a producer is available the verdict is
+  // revalidated immediately so a caller that resets after a state change does
+  // not serve a stale answer or move the work onto the next probe.
   function reset() {
     entry = null;
+    if (ttlMs > 0 && producer) compute();
   }
 
   return {
+    start,
+    stop,
     read,
     reset,
     get ttlMs() { return ttlMs; },
-    get validations() { return validations; }
+    get validations() { return validations; },
+    get running() { return timer !== null; }
   };
 }
 
@@ -220,7 +258,8 @@ function start(port, dataDir, options = {}) {
     windowMs: options.rateLimitWindowMs
   });
   const healthCache = createHealthCache({
-    ttlMs: options.healthTtl ?? process.env.FEMTOCHAIN_API_HEALTH_TTL
+    ttlMs: options.healthTtl ?? process.env.FEMTOCHAIN_API_HEALTH_TTL,
+    compute: () => readChainState(chain)
   });
   const server = http.createServer((req, res) =>
     handle(req, res, { chain, port, apiToken, rateLimit, maxBodyBytes, rateLimiter, healthCache }));
@@ -228,6 +267,10 @@ function start(port, dataDir, options = {}) {
   // server and the health cache holds this server's cached readiness verdict.
   server.rateLimiter = rateLimiter;
   server.healthCache = healthCache;
+  // Refresh the readiness verdict off the request path. Stopping the timer on
+  // close keeps a short-lived server (and the tests) from leaving it behind.
+  healthCache.start();
+  server.on('close', () => healthCache.stop());
   applyServerTimeouts(server, {
     headersTimeout: options.headersTimeout ?? process.env.FEMTOCHAIN_API_HEADERS_TIMEOUT,
     requestTimeout: options.requestTimeout ?? process.env.FEMTOCHAIN_API_REQUEST_TIMEOUT,
@@ -353,10 +396,10 @@ function readChainState(chain) {
 
 // Lightweight liveness/readiness probe. Returns 200 when the node's chain is
 // valid and 503 when it is not, so orchestrators can restart unhealthy nodes.
+// The chain-derived half of the answer comes from the background cache, so a
+// probe never pays for a full chain walk.
 function sendHealth(res, chain, healthCache) {
-  const state = healthCache
-    ? healthCache.read(() => readChainState(chain))
-    : readChainState(chain);
+  const state = (healthCache && healthCache.read()) || readChainState(chain);
 
   const body = {
     status: state.chainValid ? 'ok' : 'unhealthy',

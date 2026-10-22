@@ -25,8 +25,11 @@ node index.js
 # Specify port and bootstrap seed
 node index.js 3000 --seed seed.femtochain.io:3000
 
-# Run headless (no interactive CLI) with REST API
-node index.js 3000 --api-port 4000 &
+# Run headless (no interactive CLI)
+node index.js --headless 3000
+
+# Run the REST API against the node's data directory
+node server/api.js --port 4000
 ```
 
 ### Interactive Commands
@@ -85,7 +88,7 @@ The project now includes a few security defaults for safer use:
 - HTTP server timeouts (`headersTimeout`, `requestTimeout`, `keepAliveTimeout`) are configurable and protect against slowloris-style connection exhaustion. See `FEMTOCHAIN_API_HEADERS_TIMEOUT`, `FEMTOCHAIN_API_REQUEST_TIMEOUT`, `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT`, and `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL`.
 - Peer and payload limits are enforced in the node layer.
 - A health/readiness probe is exposed at `GET /health` (alias `GET /api/health`). It is unauthenticated and exempt from rate limiting so load balancers and orchestrators can always reach it, and it returns `503` when the chain fails validation.
-- The health probe caches its chain verdict for a short window (default 1 second, configurable with FEMTOCHAIN_API_HEALTH_TTL or `--health-ttl`, set it to 0 to revalidate on every request). A burst of probes reuses one result instead of walking the whole chain each time, while `uptime` and `timestamp` stay fresh on every response.
+- The health probe's chain verdict is refreshed on a background timer (default 1 second, configurable with FEMTOCHAIN_API_HEALTH_TTL or `--health-ttl`). Probes only read the last result, so response time does not grow with chain length, and the timer stops when the server closes. Setting the interval to 0 disables the timer and validates the chain on every request.
 - Dependency checks should run regularly with `npm audit`.
 
 Example:

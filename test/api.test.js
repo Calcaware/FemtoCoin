@@ -361,39 +361,87 @@ describe('API Server HTTP timeouts', () => {
 });
 
 describe('API health cache', () => {
-  const T0 = 1700000000000;
-
-  it('reuses the verdict within the TTL and recomputes afterwards', () => {
-    const cache = createHealthCache({ ttlMs: 1000 });
+  it('computes an initial verdict and serves it without recomputing', () => {
+    const cache = createHealthCache({ ttlMs: 60000 });
     let calls = 0;
-    const compute = () => { calls += 1; return { chainValid: true }; };
+    const compute = () => { calls += 1; return { chainValid: true, blocks: calls }; };
 
-    const first = cache.read(compute, T0);
-    assert.strictEqual(cache.read(compute, T0 + 500), first);
+    cache.start(compute);
     assert.strictEqual(calls, 1);
     assert.strictEqual(cache.validations, 1);
+    assert.strictEqual(cache.running, true);
 
-    cache.read(compute, T0 + 1500);
-    assert.strictEqual(calls, 2);
+    const first = cache.read();
+    assert.strictEqual(cache.read(), first);
+    assert.strictEqual(calls, 1);
+    cache.stop();
+  });
+
+  it('refreshes the verdict from the timer instead of the reader', async () => {
+    const cache = createHealthCache({ ttlMs: 20 });
+    let calls = 0;
+    const compute = () => { calls += 1; return { chainValid: true, blocks: calls }; };
+
+    cache.start(compute);
+    try {
+      const initial = cache.validations;
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.ok(cache.validations > initial);
+      // Reads only ever observe the last result; they never add validations.
+      const observed = cache.validations;
+      for (let i = 0; i < 10; i++) cache.read();
+      assert.strictEqual(cache.validations, observed);
+      assert.strictEqual(cache.read().blocks, observed);
+    } finally {
+      cache.stop();
+    }
   });
 
   it('recomputes on every read when the TTL is zero', () => {
     const cache = createHealthCache({ ttlMs: 0 });
     let calls = 0;
     const compute = () => { calls += 1; return calls; };
-    assert.strictEqual(cache.read(compute, T0), 1);
-    assert.strictEqual(cache.read(compute, T0), 2);
+
+    cache.start(compute);
+    assert.strictEqual(cache.running, false);
+    assert.strictEqual(cache.read(), 1);
+    assert.strictEqual(cache.read(), 2);
     assert.strictEqual(cache.validations, 2);
   });
 
-  it('drops the cached verdict when reset', () => {
+  it('stops refreshing when stopped', async () => {
+    const cache = createHealthCache({ ttlMs: 20 });
+    let calls = 0;
+    cache.start(() => { calls += 1; return calls; });
+    cache.stop();
+    const afterStop = calls;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.strictEqual(calls, afterStop);
+    assert.strictEqual(cache.running, false);
+  });
+
+  it('reports a producer failure as an unhealthy chain', () => {
+    const cache = createHealthCache({ ttlMs: 60000 });
+    cache.start(() => { throw new Error('boom'); });
+    try {
+      assert.strictEqual(cache.read().chainValid, false);
+    } finally {
+      cache.stop();
+    }
+  });
+
+  it('revalidates immediately when reset', () => {
     const cache = createHealthCache({ ttlMs: 60000 });
     let calls = 0;
-    const compute = () => { calls += 1; return calls; };
-    cache.read(compute, T0);
-    cache.reset();
-    cache.read(compute, T0 + 1);
-    assert.strictEqual(calls, 2);
+    cache.start(() => { calls += 1; return { chainValid: true, blocks: calls }; });
+    try {
+      assert.strictEqual(cache.validations, 1);
+      cache.reset();
+      assert.strictEqual(cache.validations, 2);
+      assert.strictEqual(cache.read().blocks, 2);
+    } finally {
+      cache.stop();
+    }
   });
 
   it('falls back to a positive default TTL for invalid values', () => {
@@ -403,7 +451,7 @@ describe('API health cache', () => {
 });
 
 describe('API Server health caching', () => {
-  it('validates the chain once for probes inside the TTL', async () => {
+  it('serves the startup verdict to probes inside the TTL', async () => {
     const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 60000 });
     try {
       const first = await get(`http://127.0.0.1:${port}/health`);
@@ -412,6 +460,7 @@ describe('API Server health caching', () => {
       assert.strictEqual(second.status, 200);
       assert.strictEqual(first.body.chainValid, true);
       assert.strictEqual(second.body.blocks, first.body.blocks);
+      // Both probes read the startup verdict; neither walked the chain.
       assert.strictEqual(server.healthCache.validations, 1);
 
       // Cached chain data must not freeze the per-request fields.
@@ -423,15 +472,21 @@ describe('API Server health caching', () => {
     }
   });
 
-  it('revalidates once the TTL expires', async () => {
+  it('refreshes in the background once the TTL expires', async () => {
     const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 50 });
     try {
-      await get(`http://127.0.0.1:${port}/health`);
+      // The initial verdict is computed at startup and the timer refreshes it
+      // without any probe traffic.
       assert.strictEqual(server.healthCache.validations, 1);
+      await new Promise((resolve) => setTimeout(resolve, 140));
+      assert.ok(server.healthCache.validations > 1);
 
-      await new Promise((resolve) => setTimeout(resolve, 120));
-      await get(`http://127.0.0.1:${port}/health`);
-      assert.strictEqual(server.healthCache.validations, 2);
+      const observed = server.healthCache.validations;
+      const { status, body } = await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(status, 200);
+      assert.strictEqual(body.chainValid, true);
+      // The probe read the cached verdict instead of validating the chain.
+      assert.strictEqual(server.healthCache.validations, observed);
     } finally {
       await closeServer(server);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -442,6 +497,7 @@ describe('API Server health caching', () => {
     const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 0 });
     try {
       assert.strictEqual(server.healthCache.ttlMs, 0);
+      assert.strictEqual(server.healthCache.running, false);
       for (let i = 0; i < 3; i++) {
         const { status } = await get(`http://127.0.0.1:${port}/health`);
         assert.strictEqual(status, 200);
@@ -451,6 +507,14 @@ describe('API Server health caching', () => {
       await closeServer(server);
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('stops the refresh timer when the server closes', async () => {
+    const { server, dir } = await startOnEphemeralPort({ healthTtl: 20 });
+    assert.strictEqual(server.healthCache.running, true);
+    await closeServer(server);
+    assert.strictEqual(server.healthCache.running, false);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 
