@@ -448,6 +448,39 @@ describe('API health cache', () => {
     assert.ok(createHealthCache({ ttlMs: 'abc' }).ttlMs > 0);
     assert.ok(createHealthCache({ ttlMs: -10 }).ttlMs > 0);
   });
+
+  it('reports when the verdict was refreshed and how long it took', () => {
+    const cache = createHealthCache({ ttlMs: 60000 });
+    cache.start(() => ({ chainValid: true, blocks: 3 }));
+    try {
+      const snapshot = cache.snapshot();
+      assert.strictEqual(snapshot.ttlMs, 60000);
+      assert.strictEqual(snapshot.validations, 1);
+      assert.strictEqual(snapshot.running, true);
+      assert.ok(Number.isFinite(snapshot.lastRefreshAt));
+      assert.ok(Number.isFinite(snapshot.lastRefreshDurationMs));
+      assert.ok(snapshot.lastRefreshDurationMs >= 0);
+      // Age is measured against the clock the caller supplies, so monitoring
+      // can point at the exact moment it sampled the verdict.
+      assert.strictEqual(cache.snapshot(snapshot.lastRefreshAt + 2500).ageMs, 2500);
+    } finally {
+      cache.stop();
+    }
+  });
+
+  it('reports freshness for on-demand validation when the TTL is zero', () => {
+    const cache = createHealthCache({ ttlMs: 0 });
+    cache.start(() => ({ chainValid: true, blocks: 1 }));
+    const state = cache.read();
+    const snapshot = cache.snapshot();
+
+    assert.strictEqual(state.chainValid, true);
+    assert.strictEqual(snapshot.ttlMs, 0);
+    assert.strictEqual(snapshot.running, false);
+    assert.ok(Number.isFinite(snapshot.ageMs));
+    assert.ok(snapshot.ageMs >= 0);
+    assert.ok(snapshot.lastRefreshAt <= Date.now());
+  });
 });
 
 describe('API Server health caching', () => {
@@ -466,6 +499,14 @@ describe('API Server health caching', () => {
       // Cached chain data must not freeze the per-request fields.
       assert.ok(Math.abs(Date.now() - second.body.timestamp) < 2000);
       assert.ok(typeof second.body.uptime === 'number');
+
+      // Freshness metadata accompanies the cached verdict.
+      assert.strictEqual(second.body.healthCache.ttlMs, 60000);
+      assert.strictEqual(second.body.healthCache.validations, 1);
+      assert.strictEqual(second.body.healthCache.running, true);
+      assert.ok(Number.isFinite(second.body.healthCache.lastRefreshAt));
+      assert.ok(Number.isFinite(second.body.healthCache.lastRefreshDurationMs));
+      assert.ok(second.body.healthCache.ageMs >= 0);
     } finally {
       await closeServer(server);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -514,6 +555,7 @@ describe('API Server health caching', () => {
     assert.strictEqual(server.healthCache.running, true);
     await closeServer(server);
     assert.strictEqual(server.healthCache.running, false);
+    assert.strictEqual(server.healthCache.snapshot().running, false);
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });

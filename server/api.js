@@ -93,18 +93,25 @@ function createHealthCache(options = {}) {
   let producer = typeof options.compute === 'function' ? options.compute : null;
   let entry = null;
   let validations = 0;
+  let lastRefreshAt = null;
+  let lastRefreshDurationMs = null;
   let timer = null;
 
   // Runs one validation and stores the result. A producer that throws is
   // recorded as an unhealthy chain instead of taking the timer down with it.
+  // The duration is measured against the real clock so a caller-supplied
+  // timestamp cannot turn it negative.
   function compute(now = Date.now()) {
     if (!producer) return null;
+    const startedAt = Date.now();
     let value;
     try {
       value = producer();
     } catch (_) {
       value = { chainValid: false, blocks: 0, latestHash: null };
     }
+    lastRefreshDurationMs = Math.max(0, Date.now() - startedAt);
+    lastRefreshAt = now;
     entry = { value, at: now };
     validations += 1;
     return value;
@@ -144,11 +151,28 @@ function createHealthCache(options = {}) {
     if (ttlMs > 0 && producer) compute();
   }
 
+  // Describes how fresh the cached verdict is. ageMs grows past ttlMs when the
+  // refresh timer stalls, which is what makes a slow or wedged refresh visible
+  // to monitoring instead of looking like a healthy but frozen answer. The
+  // supplied clock is used for the age so callers can reason in one time base.
+  function snapshot(now = Date.now()) {
+    const ageMs = entry ? Math.max(0, now - entry.at) : null;
+    return {
+      ttlMs,
+      ageMs,
+      lastRefreshAt,
+      lastRefreshDurationMs,
+      validations,
+      running: timer !== null
+    };
+  }
+
   return {
     start,
     stop,
     read,
     reset,
+    snapshot,
     get ttlMs() { return ttlMs; },
     get validations() { return validations; },
     get running() { return timer !== null; }
@@ -397,9 +421,11 @@ function readChainState(chain) {
 // Lightweight liveness/readiness probe. Returns 200 when the node's chain is
 // valid and 503 when it is not, so orchestrators can restart unhealthy nodes.
 // The chain-derived half of the answer comes from the background cache, so a
-// probe never pays for a full chain walk.
+// probe never pays for a full chain walk. Cache freshness is reported next to
+// the verdict so a stalled refresh shows up as a growing age.
 function sendHealth(res, chain, healthCache) {
   const state = (healthCache && healthCache.read()) || readChainState(chain);
+  const freshness = healthCache ? healthCache.snapshot() : null;
 
   const body = {
     status: state.chainValid ? 'ok' : 'unhealthy',
@@ -410,6 +436,7 @@ function sendHealth(res, chain, healthCache) {
     latestBlock: state.latestHash,
     version: PKG_VERSION || null
   };
+  if (freshness) body.healthCache = freshness;
 
   res.writeHead(state.chainValid ? 200 : 503, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body, bigintReplacer, 2) + '\n');

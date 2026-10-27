@@ -57,7 +57,7 @@ const API = 'http://localhost:4000';
 const endpoints = [
   {
     method: 'GET', path: '/health',
-    desc: 'Lightweight liveness/readiness probe. Returns 200 when the chain is valid, 503 otherwise. Unauthenticated and exempt from rate limiting. The chain verdict is cached briefly (default 1s, tunable with FEMTOCHAIN_API_HEALTH_TTL).',
+    desc: 'Lightweight liveness/readiness probe. Returns 200 when the chain is valid, 503 otherwise. Unauthenticated and exempt from rate limiting. The chain verdict is cached briefly (default 1s, tunable with FEMTOCHAIN_API_HEALTH_TTL), and the response reports cache age and refresh duration under <code>healthCache</code>.',
     tryArgs: null,
     curl: 'curl http://localhost:4000/health'
   },

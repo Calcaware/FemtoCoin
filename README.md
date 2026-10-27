@@ -88,7 +88,7 @@ The project now includes a few security defaults for safer use:
 - HTTP server timeouts (`headersTimeout`, `requestTimeout`, `keepAliveTimeout`) are configurable and protect against slowloris-style connection exhaustion. See `FEMTOCHAIN_API_HEADERS_TIMEOUT`, `FEMTOCHAIN_API_REQUEST_TIMEOUT`, `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT`, and `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL`.
 - Peer and payload limits are enforced in the node layer.
 - A health/readiness probe is exposed at `GET /health` (alias `GET /api/health`). It is unauthenticated and exempt from rate limiting so load balancers and orchestrators can always reach it, and it returns `503` when the chain fails validation.
-- The health probe's chain verdict is refreshed on a background timer (default 1 second, configurable with FEMTOCHAIN_API_HEALTH_TTL or `--health-ttl`). Probes only read the last result, so response time does not grow with chain length, and the timer stops when the server closes. Setting the interval to 0 disables the timer and validates the chain on every request.
+- The health probe's chain verdict is refreshed on a background timer (default 1 second, configurable with FEMTOCHAIN_API_HEALTH_TTL or `--health-ttl`). Probes only read the last result, so response time does not grow with chain length, and the timer stops when the server closes. Setting the interval to 0 disables the timer and validates the chain on every request. Each response also carries a `healthCache` object with `ttlMs`, `ageMs` (how old the served verdict is), `lastRefreshAt`, `lastRefreshDurationMs`, `validations`, and `running`, so a slow or stalled refresh is visible to monitoring.
 - Dependency checks should run regularly with `npm audit`.
 
 Example:
@@ -124,7 +124,7 @@ test/
   wallet.test.js   Unit tests for save/load, encrypted keystore, wrong password rejection
   node.test.js     Unit tests for peer handling, mempool rules, node limits
   peer.test.js     Unit tests for peer connection metadata and message handling
-  api.test.js      Integration tests for REST API endpoints, rate limiting, CORS
+  api.test.js      Integration tests for REST API endpoints, rate limiting, health caching, CORS
 src/
   crypto.ts        TypeScript port of the hashing and signature primitives
   transaction.ts   TypeScript transaction model
