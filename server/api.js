@@ -17,6 +17,7 @@ const DEFAULT_CONNECTIONS_CHECK_INTERVAL_MS = 30 * 1000;
 const DEFAULT_RATE_LIMIT_MAX_CLIENTS = 10000;
 const DEFAULT_RATE_LIMIT_SWEEP_MS = 30 * 1000;
 const DEFAULT_HEALTH_TTL_MS = 1000;
+const DEFAULT_HEALTH_HISTORY_SIZE = 20;
 
 // Coerces a configured value into a positive whole number, falling back to a
 // safe default when the value is missing or invalid.
@@ -90,11 +91,19 @@ function createRateLimiter(options = {}) {
 // and timestamp are still produced fresh by the caller.
 function createHealthCache(options = {}) {
   const ttlMs = resolveDuration(options.ttlMs, DEFAULT_HEALTH_TTL_MS);
+  const historySize = resolvePositiveInt(options.historySize, DEFAULT_HEALTH_HISTORY_SIZE);
   let producer = typeof options.compute === 'function' ? options.compute : null;
   let entry = null;
   let validations = 0;
+  let failures = 0;
   let lastRefreshAt = null;
   let lastRefreshDurationMs = null;
+  let lastSuccessAt = null;
+  let lastFailureAt = null;
+  // A bounded, oldest-first record of recent refresh outcomes. The last verdict
+  // alone cannot show flapping: one failed refresh followed by a success would
+  // otherwise disappear without a trace.
+  const history = [];
   let timer = null;
 
   // Runs one validation and stores the result. A producer that throws is
@@ -105,15 +114,30 @@ function createHealthCache(options = {}) {
     if (!producer) return null;
     const startedAt = Date.now();
     let value;
+    let ok = true;
     try {
       value = producer();
     } catch (_) {
       value = { chainValid: false, blocks: 0, latestHash: null };
+      ok = false;
     }
+    // A producer that returns a chain-invalid verdict also counts as a failed
+    // refresh, so readiness flaps are visible without waiting for a throw.
+    if (value && typeof value === 'object' && value.chainValid === false) ok = false;
+
     lastRefreshDurationMs = Math.max(0, Date.now() - startedAt);
     lastRefreshAt = now;
     entry = { value, at: now };
     validations += 1;
+    if (ok) {
+      lastSuccessAt = now;
+    } else {
+      failures += 1;
+      lastFailureAt = now;
+    }
+
+    history.push({ at: now, ok });
+    while (history.length > historySize) history.shift();
     return value;
   }
 
@@ -157,12 +181,20 @@ function createHealthCache(options = {}) {
   // supplied clock is used for the age so callers can reason in one time base.
   function snapshot(now = Date.now()) {
     const ageMs = entry ? Math.max(0, now - entry.at) : null;
+    const recentFailures = history.reduce((count, item) => count + (item.ok ? 0 : 1), 0);
     return {
       ttlMs,
       ageMs,
       lastRefreshAt,
       lastRefreshDurationMs,
+      lastSuccessAt,
+      lastFailureAt,
+      lastRefreshFailed: history.length > 0 ? !history[history.length - 1].ok : null,
       validations,
+      failures,
+      recentFailures,
+      recentSamples: history.length,
+      historySize,
       running: timer !== null
     };
   }
@@ -175,6 +207,7 @@ function createHealthCache(options = {}) {
     snapshot,
     get ttlMs() { return ttlMs; },
     get validations() { return validations; },
+    get failures() { return failures; },
     get running() { return timer !== null; }
   };
 }

@@ -468,6 +468,64 @@ describe('API health cache', () => {
     }
   });
 
+  it('counts failed refreshes and remembers when they happened', () => {
+    const cache = createHealthCache({ ttlMs: 0, historySize: 10 });
+    let fail = true;
+    cache.start(() => {
+      if (fail) throw new Error('boom');
+      return { chainValid: true, blocks: 4 };
+    });
+
+    cache.read(1000);
+    fail = false;
+    cache.read(2000);
+
+    const snapshot = cache.snapshot(2500);
+    assert.strictEqual(snapshot.validations, 2);
+    assert.strictEqual(snapshot.failures, 1);
+    assert.strictEqual(snapshot.lastFailureAt, 1000);
+    assert.strictEqual(snapshot.lastSuccessAt, 2000);
+    assert.strictEqual(snapshot.lastRefreshFailed, false);
+    assert.strictEqual(snapshot.recentFailures, 1);
+    assert.strictEqual(snapshot.recentSamples, 2);
+  });
+
+  it('forgets failures that fall out of the rolling history window', () => {
+    const cache = createHealthCache({ ttlMs: 0, historySize: 3 });
+    let fail = true;
+    cache.start(() => {
+      if (fail) throw new Error('boom');
+      return { chainValid: true, blocks: 1 };
+    });
+
+    cache.read(1000);
+    fail = false;
+    cache.read(2000);
+    cache.read(3000);
+    cache.read(4000);
+
+    const snapshot = cache.snapshot(4000);
+    // The total counter survives, but the window only reflects the successes.
+    assert.strictEqual(snapshot.failures, 1);
+    assert.strictEqual(snapshot.lastFailureAt, 1000);
+    assert.strictEqual(snapshot.recentFailures, 0);
+    assert.strictEqual(snapshot.recentSamples, 3);
+    assert.strictEqual(snapshot.historySize, 3);
+  });
+
+  it('treats an unhealthy verdict as a failed refresh', () => {
+    const cache = createHealthCache({ ttlMs: 60000 });
+    cache.start(() => ({ chainValid: false, blocks: 2 }));
+    try {
+      const snapshot = cache.snapshot();
+      assert.strictEqual(snapshot.failures, 1);
+      assert.strictEqual(snapshot.lastRefreshFailed, true);
+      assert.strictEqual(snapshot.recentFailures, 1);
+    } finally {
+      cache.stop();
+    }
+  });
+
   it('reports freshness for on-demand validation when the TTL is zero', () => {
     const cache = createHealthCache({ ttlMs: 0 });
     cache.start(() => ({ chainValid: true, blocks: 1 }));
@@ -507,6 +565,14 @@ describe('API Server health caching', () => {
       assert.ok(Number.isFinite(second.body.healthCache.lastRefreshAt));
       assert.ok(Number.isFinite(second.body.healthCache.lastRefreshDurationMs));
       assert.ok(second.body.healthCache.ageMs >= 0);
+      // Refresh history reports a clean run without any flapping.
+      assert.strictEqual(second.body.healthCache.failures, 0);
+      assert.strictEqual(second.body.healthCache.recentFailures, 0);
+      assert.strictEqual(second.body.healthCache.recentSamples, 1);
+      assert.strictEqual(second.body.healthCache.historySize, 20);
+      assert.strictEqual(second.body.healthCache.lastRefreshFailed, false);
+      assert.ok(Number.isFinite(second.body.healthCache.lastSuccessAt));
+      assert.strictEqual(second.body.healthCache.lastFailureAt, null);
     } finally {
       await closeServer(server);
       fs.rmSync(dir, { recursive: true, force: true });

@@ -41,6 +41,7 @@ The suite verifies:
 - health check verdicts are refreshed by a background timer, probes never walk the chain, and the timer stops when the server closes
 - setting the health refresh interval to 0 disables the timer and validates the chain on every probe
 - health responses report cache age, last refresh time, and refresh duration
+- failed health refreshes are counted, timestamped, and retained in a rolling history window that forgets old failures
 - each server instance keeps its own rate limit store
 - CORS responses only trust configured or exact local origins
 - node-level limits for peer and message abuse

@@ -1,7 +1,7 @@
 # TODO - FemtoCoin Project
 
 ## Project Status
-- ✅ All 139 tests pass
+- ✅ All 142 tests pass
 - ✅ TypeScript typecheck passes with strict mode
 - ✅ `npm audit` reports 0 vulnerabilities (protobufjs upgraded)
 - ✅ Phase 1 (hardening) from UPGRADE_PLAN.md is complete
@@ -13,6 +13,7 @@
 - ✅ HTTP server timeouts implemented (slowloris protection)
 - ✅ Health check verdicts are refreshed on a background timer, so probes never walk the chain
 - ✅ `GET /health` reports cache age, last refresh time, and refresh duration so stale verdicts are visible
+- ✅ Health refresh history records failed refreshes in a rolling window so flapping readiness stays visible
 
 ## Phase 1: Completed ✅
 - [x] Upgrade protobufjs to patched version (8.8.0+)
@@ -38,7 +39,8 @@
 - [x] **Cache health check results** - `GET /health` no longer walks the whole chain on every unauthenticated probe. `createHealthCache()` in `server/api.js` holds the chain-derived verdict (validity, height, latest hash) for a short TTL (default 1000 ms, `FEMTOCHAIN_API_HEALTH_TTL` or `--health-ttl`, 0 disables caching), while `uptime` and `timestamp` are still produced per request. The cache lives on the server instance as `server.healthCache` and exposes `reset()` for forced revalidation.
 - [x] **Revalidate health checks in the background** - `createHealthCache()` in `server/api.js` now owns a refresh timer. It computes one verdict at startup and then refreshes it every `FEMTOCHAIN_API_HEALTH_TTL` milliseconds (default 1000, `--health-ttl`), while `GET /health` only reads the last result, so request latency no longer depends on chain length. The timer is stopped when the server closes, a producer failure is reported as an unhealthy chain instead of killing the timer, and a TTL of 0 still disables the timer and validates on every request. `reset()` revalidates immediately.
 - [x] **Expose health cache freshness** - The background refresh hides chain walks from probes, so the cache now tracks the last refresh time and duration. `GET /health` includes a `healthCache` object with `ttlMs`, `ageMs`, `lastRefreshAt`, `lastRefreshDurationMs`, `validations`, and `running`, making a slow or stalled refresh visible to monitoring. `createHealthCache().snapshot()` accepts a clock so age can be sampled against a known time.
-- [ ] **Track health refresh history** - The freshness metadata only describes the most recent refresh, so an intermittent producer failure that is followed by a successful run leaves no trace. Keep a short rolling window or counter of failed refreshes and expose it in `GET /health` so flapping readiness is visible.
+- [x] **Track health refresh history** - `createHealthCache()` in `server/api.js` now keeps a bounded, oldest-first window of recent refresh outcomes (default 20, `historySize`). A refresh counts as failed when the producer throws or returns a chain-invalid verdict, and totals are kept separately from the window. `GET /health` exposes `failures`, `recentFailures`, `recentSamples`, `historySize`, `lastRefreshFailed`, `lastSuccessAt`, and `lastFailureAt` in its `healthCache` object, so one failure followed by a success no longer disappears.
+- [ ] **Check storage readiness** - Include a writability check for the chain data directory in `GET /health` so a read-only or full volume is reported before block writes start failing.
 - [ ] **Harden Docker containers** - Run as non-root user, add HEALTHCHECK in Dockerfile, proper volume permissions
 - [ ] **Improve error handling** - Consistent error reporting and graceful degradation across modules
 
