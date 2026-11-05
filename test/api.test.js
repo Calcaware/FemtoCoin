@@ -4,7 +4,7 @@ const http = require('http');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
-const { start, applyServerTimeouts, createRateLimiter, createHealthCache } = require('../server/api');
+const { start, applyServerTimeouts, createRateLimiter, createHealthCache, checkStorageWritable } = require('../server/api');
 const crypto = require('../lib/crypto');
 const { COIN } = require('../lib/unit');
 
@@ -194,6 +194,11 @@ describe('API Server (standalone)', () => {
     assert.ok(typeof body.timestamp === 'number');
     assert.ok(body.latestBlock);
     assert.ok(body.version);
+    assert.strictEqual(body.storage.writable, true);
+    assert.strictEqual(body.storage.error, null);
+    assert.strictEqual(body.storage.path, dir);
+    // The writability probe must not leave its file behind.
+    assert.deepStrictEqual(fs.readdirSync(dir).filter(name => name.endsWith('.tmp')), []);
   });
 
   it('GET /api/health is an alias for /health', async () => {
@@ -538,6 +543,85 @@ describe('API health cache', () => {
     assert.ok(Number.isFinite(snapshot.ageMs));
     assert.ok(snapshot.ageMs >= 0);
     assert.ok(snapshot.lastRefreshAt <= Date.now());
+  });
+});
+
+describe('API storage readiness', () => {
+  it('reports a writable data directory and cleans up its probe file', () => {
+    const dir = tempDir();
+    try {
+      const storage = checkStorageWritable(dir);
+      assert.strictEqual(storage.writable, true);
+      assert.strictEqual(storage.error, null);
+      assert.strictEqual(storage.path, dir);
+      assert.deepStrictEqual(fs.readdirSync(dir), []);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports an unusable data directory with an error code', () => {
+    const dir = tempDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const blocker = path.join(dir, 'not-a-directory');
+    fs.writeFileSync(blocker, 'x');
+    try {
+      const storage = checkStorageWritable(path.join(blocker, 'data'));
+      assert.strictEqual(storage.writable, false);
+      assert.strictEqual(storage.error, 'ENOTDIR');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a missing data directory instead of guessing', () => {
+    const storage = checkStorageWritable('');
+    assert.strictEqual(storage.writable, false);
+    assert.strictEqual(storage.path, null);
+    assert.ok(storage.error);
+  });
+
+  it('marks the health endpoint unhealthy when the data directory cannot be written', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 60000 });
+    try {
+      // Replace the data directory with a file so the probe write must fail.
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.writeFileSync(dir, '');
+      server.healthCache.reset();
+
+      const { status, body } = await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(status, 503);
+      assert.strictEqual(body.status, 'unhealthy');
+      assert.strictEqual(body.chainValid, true);
+      assert.strictEqual(body.storage.writable, false);
+      assert.ok(body.storage.error);
+      // A storage failure is a failed refresh, just like a bad chain verdict.
+      assert.strictEqual(body.healthCache.lastRefreshFailed, true);
+      assert.ok(body.healthCache.failures >= 1);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { force: true });
+    }
+  });
+
+  it('recovers when the data directory becomes writable again', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({ healthTtl: 60000 });
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.writeFileSync(dir, '');
+      server.healthCache.reset();
+      assert.strictEqual((await get(`http://127.0.0.1:${port}/health`)).status, 503);
+
+      fs.rmSync(dir, { force: true });
+      server.healthCache.reset();
+      const { status, body } = await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(status, 200);
+      assert.strictEqual(body.status, 'ok');
+      assert.strictEqual(body.storage.writable, true);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

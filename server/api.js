@@ -1,3 +1,4 @@
+const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const Blockchain = require('../lib/chain');
@@ -31,6 +32,15 @@ function resolvePositiveInt(value, fallback) {
 function resolveDuration(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+// A chain that validates but cannot persist its next block is not ready, so a
+// failing chain check or a failing storage check both count as an unhealthy
+// verdict for the health cache.
+function isUnhealthyVerdict(value) {
+  if (!value || typeof value !== 'object') return false;
+  if (value.chainValid === false) return true;
+  return Boolean(value.storage && value.storage.writable === false);
 }
 
 // Per-client rate limit buckets in a fixed window. The store is bounded: stale
@@ -121,9 +131,11 @@ function createHealthCache(options = {}) {
       value = { chainValid: false, blocks: 0, latestHash: null };
       ok = false;
     }
-    // A producer that returns a chain-invalid verdict also counts as a failed
-    // refresh, so readiness flaps are visible without waiting for a throw.
-    if (value && typeof value === 'object' && value.chainValid === false) ok = false;
+    // A producer that throws or returns an unhealthy verdict also counts as a
+    // failed refresh, so readiness flaps are visible without waiting for a
+    // throw. Storage that cannot be written makes the node unhealthy even when
+    // the chain itself still validates.
+    if (isUnhealthyVerdict(value)) ok = false;
 
     lastRefreshDurationMs = Math.max(0, Date.now() - startedAt);
     lastRefreshAt = now;
@@ -434,6 +446,42 @@ function bigintReplacer(key, value) {
   return value;
 }
 
+// Proves the chain data directory can still accept writes. A directory that
+// exists but is mounted read-only, owned by another user, or out of space can
+// pass a permissions check yet fail on the next block append, so this writes
+// and removes a tiny probe file instead. The probe is removed on both paths so
+// a failing volume is not filled by the health check itself.
+function checkStorageWritable(dataDir) {
+  const result = {
+    writable: false,
+    path: dataDir || null,
+    error: null
+  };
+  if (!dataDir) {
+    result.error = 'No data directory configured';
+    return result;
+  }
+
+  let probePath = null;
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    probePath = path.join(dataDir, `.femtochain-health-${process.pid}.tmp`);
+    fs.writeFileSync(probePath, 'ok');
+    fs.unlinkSync(probePath);
+    result.writable = true;
+  } catch (e) {
+    result.error = e.code || e.message;
+    if (probePath) {
+      try {
+        fs.unlinkSync(probePath);
+      } catch (_) {
+        // The probe may never have been created, which is expected here.
+      }
+    }
+  }
+  return result;
+}
+
 // Collects the chain-derived part of the readiness verdict. This is the
 // expensive half, so callers route it through the health cache.
 function readChainState(chain) {
@@ -448,30 +496,39 @@ function readChainState(chain) {
   } catch (_) {
     chainValid = false;
   }
-  return { chainValid, blocks, latestHash };
+  const storage = checkStorageWritable(chain.dataDir);
+  return { chainValid, blocks, latestHash, storage };
 }
 
 // Lightweight liveness/readiness probe. Returns 200 when the node's chain is
-// valid and 503 when it is not, so orchestrators can restart unhealthy nodes.
-// The chain-derived half of the answer comes from the background cache, so a
-// probe never pays for a full chain walk. Cache freshness is reported next to
-// the verdict so a stalled refresh shows up as a growing age.
+// valid and its data directory is writable, and 503 otherwise, so orchestrators
+// can restart unhealthy nodes. The chain-derived half of the answer comes from
+// the background cache, so a probe never pays for a full chain walk. Cache
+// freshness is reported next to the verdict so a stalled refresh shows up as a
+// growing age.
 function sendHealth(res, chain, healthCache) {
   const state = (healthCache && healthCache.read()) || readChainState(chain);
   const freshness = healthCache ? healthCache.snapshot() : null;
+  const storage = state.storage || {
+    writable: false,
+    path: chain.dataDir || null,
+    error: 'Storage state unavailable'
+  };
+  const healthy = state.chainValid && storage.writable;
 
   const body = {
-    status: state.chainValid ? 'ok' : 'unhealthy',
+    status: healthy ? 'ok' : 'unhealthy',
     uptime: Math.floor(process.uptime()),
     timestamp: Date.now(),
     blocks: state.blocks,
     chainValid: state.chainValid,
+    storage,
     latestBlock: state.latestHash,
     version: PKG_VERSION || null
   };
   if (freshness) body.healthCache = freshness;
 
-  res.writeHead(state.chainValid ? 200 : 503, { 'Content-Type': 'application/json' });
+  res.writeHead(healthy ? 200 : 503, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body, bigintReplacer, 2) + '\n');
 }
 
@@ -614,4 +671,10 @@ if (require.main === module) {
   });
 }
 
-module.exports = { start, applyServerTimeouts, createRateLimiter, createHealthCache };
+module.exports = {
+  start,
+  applyServerTimeouts,
+  createRateLimiter,
+  createHealthCache,
+  checkStorageWritable
+};
