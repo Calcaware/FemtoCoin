@@ -19,6 +19,7 @@ const DEFAULT_RATE_LIMIT_MAX_CLIENTS = 10000;
 const DEFAULT_RATE_LIMIT_SWEEP_MS = 30 * 1000;
 const DEFAULT_HEALTH_TTL_MS = 1000;
 const DEFAULT_HEALTH_HISTORY_SIZE = 20;
+const DEFAULT_MIN_FREE_BYTES = 64 * 1024 * 1024;
 
 // Coerces a configured value into a positive whole number, falling back to a
 // safe default when the value is missing or invalid.
@@ -27,11 +28,17 @@ function resolvePositiveInt(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
+// Coerces a configured byte count or duration into a whole non-negative number.
+// Zero is meaningful for both, so it is preserved instead of replaced.
+function resolveNonNegativeInt(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
 // Coerces a configured duration into a whole number of milliseconds. Zero is a
 // valid value here and means "no caching", so the caller revalidates every time.
 function resolveDuration(value, fallback) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+  return resolveNonNegativeInt(value, fallback);
 }
 
 // A chain that validates but cannot persist its next block is not ready, so a
@@ -326,9 +333,10 @@ function start(port, dataDir, options = {}) {
       options.rateLimitMaxClients ?? process.env.FEMTOCHAIN_API_RATE_LIMIT_MAX_CLIENTS,
     windowMs: options.rateLimitWindowMs
   });
+  const minFreeBytes = options.minFreeBytes ?? process.env.FEMTOCHAIN_API_MIN_FREE_BYTES;
   const healthCache = createHealthCache({
     ttlMs: options.healthTtl ?? process.env.FEMTOCHAIN_API_HEALTH_TTL,
-    compute: () => readChainState(chain)
+    compute: () => readChainState(chain, { minFreeBytes })
   });
   const server = http.createServer((req, res) =>
     handle(req, res, { chain, port, apiToken, rateLimit, maxBodyBytes, rateLimiter, healthCache }));
@@ -446,16 +454,46 @@ function bigintReplacer(key, value) {
   return value;
 }
 
+// Reports the bytes available to the process on the volume holding the data
+// directory. A full volume usually fails the writability probe only once there
+// is nothing left, so this is sampled on the same refresh to show the trend
+// before writes start failing. Platforms without statfs, or a statfs failure,
+// leave freeBytes null without affecting the writability verdict.
+function readFreeSpace(dataDir) {
+  if (typeof fs.statfsSync !== 'function') {
+    return { freeBytes: null, error: 'statfs unavailable' };
+  }
+  try {
+    const stats = fs.statfsSync(dataDir);
+    const blockSize = Number(stats.bsize);
+    const availableBlocks = Number(stats.bavail);
+    if (!Number.isFinite(blockSize) || !Number.isFinite(availableBlocks)) {
+      return { freeBytes: null, error: 'statfs returned no block counts' };
+    }
+    return { freeBytes: Math.max(0, blockSize * availableBlocks), error: null };
+  } catch (e) {
+    return { freeBytes: null, error: e.code || e.message };
+  }
+}
+
 // Proves the chain data directory can still accept writes. A directory that
 // exists but is mounted read-only, owned by another user, or out of space can
 // pass a permissions check yet fail on the next block append, so this writes
 // and removes a tiny probe file instead. The probe is removed on both paths so
-// a failing volume is not filled by the health check itself.
-function checkStorageWritable(dataDir) {
+// a failing volume is not filled by the health check itself. Free space is
+// reported alongside the verdict; falling below the threshold is a warning, not
+// a failed readiness check, so orchestrators do not restart a node over disk
+// pressure that it can still work through.
+function checkStorageWritable(dataDir, options = {}) {
+  const minFreeBytes = resolveNonNegativeInt(options.minFreeBytes, DEFAULT_MIN_FREE_BYTES);
   const result = {
     writable: false,
     path: dataDir || null,
-    error: null
+    error: null,
+    freeBytes: null,
+    minFreeBytes,
+    lowSpace: false,
+    freeBytesError: null
   };
   if (!dataDir) {
     result.error = 'No data directory configured';
@@ -465,6 +503,10 @@ function checkStorageWritable(dataDir) {
   let probePath = null;
   try {
     fs.mkdirSync(dataDir, { recursive: true });
+    const space = readFreeSpace(dataDir);
+    result.freeBytes = space.freeBytes;
+    result.freeBytesError = space.error;
+    result.lowSpace = space.freeBytes !== null && space.freeBytes < minFreeBytes;
     probePath = path.join(dataDir, `.femtochain-health-${process.pid}.tmp`);
     fs.writeFileSync(probePath, 'ok');
     fs.unlinkSync(probePath);
@@ -484,7 +526,7 @@ function checkStorageWritable(dataDir) {
 
 // Collects the chain-derived part of the readiness verdict. This is the
 // expensive half, so callers route it through the health cache.
-function readChainState(chain) {
+function readChainState(chain, options = {}) {
   let chainValid = false;
   let blocks = 0;
   let latestHash = null;
@@ -496,7 +538,7 @@ function readChainState(chain) {
   } catch (_) {
     chainValid = false;
   }
-  const storage = checkStorageWritable(chain.dataDir);
+  const storage = checkStorageWritable(chain.dataDir, options);
   return { chainValid, blocks, latestHash, storage };
 }
 
@@ -512,7 +554,11 @@ function sendHealth(res, chain, healthCache) {
   const storage = state.storage || {
     writable: false,
     path: chain.dataDir || null,
-    error: 'Storage state unavailable'
+    error: 'Storage state unavailable',
+    freeBytes: null,
+    minFreeBytes: null,
+    lowSpace: false,
+    freeBytesError: null
   };
   const healthy = state.chainValid && storage.writable;
 
@@ -649,6 +695,7 @@ if (require.main === module) {
   let keepAliveTimeout = process.env.FEMTOCHAIN_API_KEEPALIVE_TIMEOUT;
   let connectionsCheckingInterval = process.env.FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL;
   let healthTtl = process.env.FEMTOCHAIN_API_HEALTH_TTL;
+  let minFreeBytes = process.env.FEMTOCHAIN_API_MIN_FREE_BYTES;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' || args[i] === '-p') port = parseInt(args[++i]);
@@ -662,12 +709,13 @@ if (require.main === module) {
     else if (args[i] === '--keepalive-timeout') keepAliveTimeout = parseInt(args[++i]);
     else if (args[i] === '--check-interval') connectionsCheckingInterval = parseInt(args[++i]);
     else if (args[i] === '--health-ttl') healthTtl = parseInt(args[++i]);
+    else if (args[i] === '--min-free-bytes') minFreeBytes = parseInt(args[++i]);
   }
 
   start(port, dataDir, {
     apiToken, rateLimit, rateLimitMaxClients, maxBodyBytes,
     headersTimeout, requestTimeout, keepAliveTimeout, connectionsCheckingInterval,
-    healthTtl
+    healthTtl, minFreeBytes
   });
 }
 

@@ -43,6 +43,7 @@ The suite verifies:
 - health responses report cache age, last refresh time, and refresh duration
 - failed health refreshes are counted, timestamped, and retained in a rolling history window that forgets old failures
 - the health probe verifies the chain data directory is writable, reports the storage verdict in the response, and returns 503 when a probe write fails
+- free space on the chain data volume is reported with a configurable low-space warning that does not fail readiness
 - each server instance keeps its own rate limit store
 - CORS responses only trust configured or exact local origins
 - node-level limits for peer and message abuse

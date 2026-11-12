@@ -197,6 +197,11 @@ describe('API Server (standalone)', () => {
     assert.strictEqual(body.storage.writable, true);
     assert.strictEqual(body.storage.error, null);
     assert.strictEqual(body.storage.path, dir);
+    assert.ok(Number.isFinite(body.storage.freeBytes));
+    assert.ok(body.storage.freeBytes >= 0);
+    assert.strictEqual(body.storage.freeBytesError, null);
+    assert.ok(Number.isFinite(body.storage.minFreeBytes));
+    assert.strictEqual(typeof body.storage.lowSpace, 'boolean');
     // The writability probe must not leave its file behind.
     assert.deepStrictEqual(fs.readdirSync(dir).filter(name => name.endsWith('.tmp')), []);
   });
@@ -579,6 +584,37 @@ describe('API storage readiness', () => {
     assert.strictEqual(storage.writable, false);
     assert.strictEqual(storage.path, null);
     assert.ok(storage.error);
+    assert.strictEqual(storage.freeBytes, null);
+  });
+
+  it('reports free space and warns when it falls below the threshold', () => {
+    const dir = tempDir();
+    try {
+      const roomy = checkStorageWritable(dir, { minFreeBytes: 0 });
+      assert.strictEqual(roomy.writable, true);
+      assert.ok(Number.isFinite(roomy.freeBytes));
+      assert.ok(roomy.freeBytes >= 0);
+      assert.strictEqual(roomy.freeBytesError, null);
+      assert.strictEqual(roomy.minFreeBytes, 0);
+      assert.strictEqual(roomy.lowSpace, false);
+
+      const tight = checkStorageWritable(dir, { minFreeBytes: Number.MAX_SAFE_INTEGER });
+      assert.strictEqual(tight.writable, true);
+      assert.strictEqual(tight.lowSpace, true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to a safe threshold for invalid values', () => {
+    const dir = tempDir();
+    try {
+      const storage = checkStorageWritable(dir, { minFreeBytes: 'not-a-number' });
+      assert.strictEqual(storage.minFreeBytes, 64 * 1024 * 1024);
+      assert.strictEqual(storage.writable, true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('marks the health endpoint unhealthy when the data directory cannot be written', async () => {
@@ -601,6 +637,26 @@ describe('API storage readiness', () => {
     } finally {
       await closeServer(server);
       fs.rmSync(dir, { force: true });
+    }
+  });
+
+  it('warns about low free space without failing readiness', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({
+      healthTtl: 60000,
+      minFreeBytes: Number.MAX_SAFE_INTEGER
+    });
+    try {
+      const { status, body } = await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(status, 200);
+      assert.strictEqual(body.status, 'ok');
+      assert.strictEqual(body.storage.writable, true);
+      assert.strictEqual(body.storage.lowSpace, true);
+      assert.ok(body.storage.freeBytes < body.storage.minFreeBytes);
+      // Low space is a warning; it must not count as a failed refresh.
+      assert.strictEqual(body.healthCache.lastRefreshFailed, false);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 

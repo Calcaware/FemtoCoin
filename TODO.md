@@ -1,7 +1,7 @@
 # TODO - FemtoCoin Project
 
 ## Project Status
-- ✅ All 147 tests pass
+- ✅ All 150 tests pass
 - ✅ TypeScript typecheck passes with strict mode
 - ✅ `npm audit` reports 0 vulnerabilities (protobufjs upgraded)
 - ✅ Phase 1 (hardening) from UPGRADE_PLAN.md is complete
@@ -15,6 +15,7 @@
 - ✅ `GET /health` reports cache age, last refresh time, and refresh duration so stale verdicts are visible
 - ✅ Health refresh history records failed refreshes in a rolling window so flapping readiness stays visible
 - ✅ Health probe checks that the chain data directory is writable, so a read-only or full volume reports unhealthy before block writes fail
+- ✅ Health endpoint reports free space on the chain data volume and warns below a configurable threshold before writes start failing
 
 ## Phase 1: Completed ✅
 - [x] Upgrade protobufjs to patched version (8.8.0+)
@@ -42,7 +43,8 @@
 - [x] **Expose health cache freshness** - The background refresh hides chain walks from probes, so the cache now tracks the last refresh time and duration. `GET /health` includes a `healthCache` object with `ttlMs`, `ageMs`, `lastRefreshAt`, `lastRefreshDurationMs`, `validations`, and `running`, making a slow or stalled refresh visible to monitoring. `createHealthCache().snapshot()` accepts a clock so age can be sampled against a known time.
 - [x] **Track health refresh history** - `createHealthCache()` in `server/api.js` now keeps a bounded, oldest-first window of recent refresh outcomes (default 20, `historySize`). A refresh counts as failed when the producer throws or returns a chain-invalid verdict, and totals are kept separately from the window. `GET /health` exposes `failures`, `recentFailures`, `recentSamples`, `historySize`, `lastRefreshFailed`, `lastSuccessAt`, and `lastFailureAt` in its `healthCache` object, so one failure followed by a success no longer disappears.
 - [x] **Check storage readiness** - `GET /health` now verifies the chain data directory can still accept writes by creating and removing a tiny probe file on each refresh. The response includes a `storage` object with `writable`, `path`, and `error`, and a write failure returns `503` and counts as a failed refresh, so a read-only, full, or mispermissioned volume is reported before block writes start failing.
-- [ ] **Report free space headroom** - Include available bytes for the chain data directory in `GET /health` and warn below a configurable threshold, so a filling volume is visible before the writability probe starts failing.
+- [x] **Report free space headroom** - `GET /health` now samples free space with `statfs` on each refresh and includes `freeBytes`, `minFreeBytes`, `lowSpace`, and `freeBytesError` in its `storage` object. The threshold defaults to 64 MiB (`FEMTOCHAIN_API_MIN_FREE_BYTES` or `--min-free-bytes`, 0 disables the warning) and low space sets `lowSpace` while readiness stays `200`, so a filling volume is visible before the writability probe starts failing.
+- [ ] **Report inode headroom** - Include free inode counts for the chain data directory in `GET /health` and warn below a configurable threshold, since a volume can run out of inodes while bytes remain.
 - [ ] **Harden Docker containers** - Run as non-root user, add HEALTHCHECK in Dockerfile, proper volume permissions
 - [ ] **Improve error handling** - Consistent error reporting and graceful degradation across modules
 
@@ -114,6 +116,7 @@ Key environment variables for hardened deployments:
 - `FEMTOCHAIN_API_KEEPALIVE_TIMEOUT` - Milliseconds an idle keep-alive socket is retained (default 5000)
 - `FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL` - Milliseconds between timeout sweeps of open connections (default 30000)
 - `FEMTOCHAIN_API_HEALTH_TTL` - Milliseconds between background health refresh runs (default 1000, set to 0 to disable the timer and validate on every request)
+- `FEMTOCHAIN_API_MIN_FREE_BYTES` - Free space warning threshold for the chain data volume in bytes (default 67108864, set to 0 to disable the warning)
 - `FEMTOCHAIN_CORS_ORIGIN` - Allowed CORS origins (comma-separated)
 - `FEMTOCHAIN_SECURE_WALLETS` - Require encrypted wallets by default (1/0)
 - `FEMTOCHAIN_MAX_PEERS` - Maximum concurrent peer connections
