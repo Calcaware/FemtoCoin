@@ -44,6 +44,7 @@ The suite verifies:
 - failed health refreshes are counted, timestamped, and retained in a rolling history window that forgets old failures
 - the health probe verifies the chain data directory is writable, reports the storage verdict in the response, and returns 503 when a probe write fails
 - free space on the chain data volume is reported with a configurable low-space warning that does not fail readiness
+- free inode headroom is reported separately from free bytes, warns below its own threshold without failing readiness, and is reported as unknown on platforms that do not expose inode counts
 - each server instance keeps its own rate limit store
 - CORS responses only trust configured or exact local origins
 - node-level limits for peer and message abuse

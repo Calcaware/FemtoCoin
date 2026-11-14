@@ -202,6 +202,17 @@ describe('API Server (standalone)', () => {
     assert.strictEqual(body.storage.freeBytesError, null);
     assert.ok(Number.isFinite(body.storage.minFreeBytes));
     assert.strictEqual(typeof body.storage.lowSpace, 'boolean');
+    // Inode counts are unavailable on some platforms (Windows reports zeroes),
+    // so a null count with an explanation is a valid answer.
+    assert.ok(body.storage.freeInodes === null || Number.isFinite(body.storage.freeInodes));
+    assert.ok(Number.isFinite(body.storage.minFreeInodes));
+    assert.strictEqual(typeof body.storage.lowInodes, 'boolean');
+    if (body.storage.freeInodes === null) {
+      assert.ok(body.storage.inodeError);
+      assert.strictEqual(body.storage.lowInodes, false);
+    } else {
+      assert.strictEqual(body.storage.inodeError, null);
+    }
     // The writability probe must not leave its file behind.
     assert.deepStrictEqual(fs.readdirSync(dir).filter(name => name.endsWith('.tmp')), []);
   });
@@ -606,11 +617,77 @@ describe('API storage readiness', () => {
     }
   });
 
-  it('falls back to a safe threshold for invalid values', () => {
+  it('reports free inodes and warns when they fall below the threshold', () => {
+    const dir = tempDir();
+    const statfs = () => ({ bsize: 4096, bavail: 100, files: 10000, ffree: 12 });
+    try {
+      const roomy = checkStorageWritable(dir, { statfs, minFreeInodes: 0 });
+      assert.strictEqual(roomy.writable, true);
+      assert.strictEqual(roomy.freeInodes, 12);
+      assert.strictEqual(roomy.inodeError, null);
+      assert.strictEqual(roomy.minFreeInodes, 0);
+      assert.strictEqual(roomy.lowInodes, false);
+
+      const tight = checkStorageWritable(dir, { statfs, minFreeInodes: 100 });
+      assert.strictEqual(tight.writable, true);
+      assert.strictEqual(tight.freeInodes, 12);
+      assert.strictEqual(tight.lowInodes, true);
+      // Low inode headroom is a warning, so readiness must stay true.
+      assert.strictEqual(tight.error, null);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports unknown inode headroom when statfs exposes no inode counts', () => {
     const dir = tempDir();
     try {
-      const storage = checkStorageWritable(dir, { minFreeBytes: 'not-a-number' });
+      const storage = checkStorageWritable(dir, {
+        statfs: () => ({ bsize: 4096, bavail: 10, files: 0, ffree: 0 }),
+        minFreeInodes: 100
+      });
+      assert.strictEqual(storage.writable, true);
+      assert.strictEqual(storage.freeInodes, null);
+      assert.strictEqual(storage.inodeError, 'statfs returned no inode counts');
+      assert.strictEqual(storage.lowInodes, false);
+      // Byte accounting still works when inodes are unavailable.
+      assert.strictEqual(storage.freeBytes, 40960);
+      assert.strictEqual(storage.freeBytesError, null);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a statfs failure without failing the writability verdict', () => {
+    const dir = tempDir();
+    const failingStatfs = () => {
+      const err = new Error('statfs failed');
+      err.code = 'EIO';
+      throw err;
+    };
+    try {
+      const storage = checkStorageWritable(dir, { statfs: failingStatfs });
+      assert.strictEqual(storage.writable, true);
+      assert.strictEqual(storage.freeBytes, null);
+      assert.strictEqual(storage.freeBytesError, 'EIO');
+      assert.strictEqual(storage.freeInodes, null);
+      assert.strictEqual(storage.inodeError, 'EIO');
+      assert.strictEqual(storage.lowSpace, false);
+      assert.strictEqual(storage.lowInodes, false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to safe thresholds for invalid values', () => {
+    const dir = tempDir();
+    try {
+      const storage = checkStorageWritable(dir, {
+        minFreeBytes: 'not-a-number',
+        minFreeInodes: -5
+      });
       assert.strictEqual(storage.minFreeBytes, 64 * 1024 * 1024);
+      assert.strictEqual(storage.minFreeInodes, 1000);
       assert.strictEqual(storage.writable, true);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -653,6 +730,29 @@ describe('API storage readiness', () => {
       assert.strictEqual(body.storage.lowSpace, true);
       assert.ok(body.storage.freeBytes < body.storage.minFreeBytes);
       // Low space is a warning; it must not count as a failed refresh.
+      assert.strictEqual(body.healthCache.lastRefreshFailed, false);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('warns about low inode headroom without failing readiness', async () => {
+    const { server, dir, port } = await startOnEphemeralPort({
+      healthTtl: 60000,
+      minFreeInodes: 100,
+      statfs: () => ({ bsize: 4096, bavail: 100000, files: 1000000, ffree: 7 })
+    });
+    try {
+      const { status, body } = await get(`http://127.0.0.1:${port}/health`);
+      assert.strictEqual(status, 200);
+      assert.strictEqual(body.status, 'ok');
+      assert.strictEqual(body.storage.writable, true);
+      assert.strictEqual(body.storage.freeInodes, 7);
+      assert.strictEqual(body.storage.minFreeInodes, 100);
+      assert.strictEqual(body.storage.lowInodes, true);
+      assert.strictEqual(body.storage.inodeError, null);
+      // Low inodes are a warning; they must not count as a failed refresh.
       assert.strictEqual(body.healthCache.lastRefreshFailed, false);
     } finally {
       await closeServer(server);

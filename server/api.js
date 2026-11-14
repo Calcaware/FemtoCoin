@@ -20,6 +20,7 @@ const DEFAULT_RATE_LIMIT_SWEEP_MS = 30 * 1000;
 const DEFAULT_HEALTH_TTL_MS = 1000;
 const DEFAULT_HEALTH_HISTORY_SIZE = 20;
 const DEFAULT_MIN_FREE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MIN_FREE_INODES = 1000;
 
 // Coerces a configured value into a positive whole number, falling back to a
 // safe default when the value is missing or invalid.
@@ -334,9 +335,10 @@ function start(port, dataDir, options = {}) {
     windowMs: options.rateLimitWindowMs
   });
   const minFreeBytes = options.minFreeBytes ?? process.env.FEMTOCHAIN_API_MIN_FREE_BYTES;
+  const minFreeInodes = options.minFreeInodes ?? process.env.FEMTOCHAIN_API_MIN_FREE_INODES;
   const healthCache = createHealthCache({
     ttlMs: options.healthTtl ?? process.env.FEMTOCHAIN_API_HEALTH_TTL,
-    compute: () => readChainState(chain, { minFreeBytes })
+    compute: () => readChainState(chain, { minFreeBytes, minFreeInodes, statfs: options.statfs })
   });
   const server = http.createServer((req, res) =>
     handle(req, res, { chain, port, apiToken, rateLimit, maxBodyBytes, rateLimiter, healthCache }));
@@ -454,38 +456,68 @@ function bigintReplacer(key, value) {
   return value;
 }
 
-// Reports the bytes available to the process on the volume holding the data
+// Reports the headroom available to the process on the volume holding the data
 // directory. A full volume usually fails the writability probe only once there
 // is nothing left, so this is sampled on the same refresh to show the trend
-// before writes start failing. Platforms without statfs, or a statfs failure,
-// leave freeBytes null without affecting the writability verdict.
-function readFreeSpace(dataDir) {
-  if (typeof fs.statfsSync !== 'function') {
-    return { freeBytes: null, error: 'statfs unavailable' };
+// before writes start failing. Bytes and inode counts are read separately so a
+// platform that reports blocks but not inodes (Windows returns zeroes for
+// files) still reports free space. Platforms without statfs, or a statfs
+// failure, leave the affected values null without changing the writability
+// verdict.
+function readFilesystemStats(dataDir, statfs = fs.statfsSync) {
+  const result = { freeBytes: null, freeInodes: null, error: null, inodeError: null };
+  if (typeof statfs !== 'function') {
+    result.error = 'statfs unavailable';
+    result.inodeError = 'statfs unavailable';
+    return result;
   }
+
+  let stats;
   try {
-    const stats = fs.statfsSync(dataDir);
-    const blockSize = Number(stats.bsize);
-    const availableBlocks = Number(stats.bavail);
-    if (!Number.isFinite(blockSize) || !Number.isFinite(availableBlocks)) {
-      return { freeBytes: null, error: 'statfs returned no block counts' };
-    }
-    return { freeBytes: Math.max(0, blockSize * availableBlocks), error: null };
+    stats = statfs(dataDir);
   } catch (e) {
-    return { freeBytes: null, error: e.code || e.message };
+    const reason = e.code || e.message;
+    result.error = reason;
+    result.inodeError = reason;
+    return result;
   }
+
+  const blockSize = Number(stats.bsize);
+  const availableBlocks = Number(stats.bavail);
+  if (!Number.isFinite(blockSize) || !Number.isFinite(availableBlocks)) {
+    result.error = 'statfs returned no block counts';
+  } else {
+    result.freeBytes = Math.max(0, blockSize * availableBlocks);
+  }
+
+  // A total inode count of zero means the filesystem does not expose inode
+  // usage, which is common on Windows. Treat that as unknown instead of
+  // reporting an exhausted volume.
+  const totalInodes = Number(stats.files);
+  const freeInodes = Number(stats.ffree);
+  if (!Number.isFinite(totalInodes) || !Number.isFinite(freeInodes) ||
+      totalInodes <= 0 || freeInodes < 0) {
+    result.inodeError = 'statfs returned no inode counts';
+  } else {
+    result.freeInodes = Math.max(0, Math.floor(freeInodes));
+  }
+
+  return result;
 }
 
 // Proves the chain data directory can still accept writes. A directory that
 // exists but is mounted read-only, owned by another user, or out of space can
 // pass a permissions check yet fail on the next block append, so this writes
 // and removes a tiny probe file instead. The probe is removed on both paths so
-// a failing volume is not filled by the health check itself. Free space is
-// reported alongside the verdict; falling below the threshold is a warning, not
-// a failed readiness check, so orchestrators do not restart a node over disk
-// pressure that it can still work through.
+// a failing volume is not filled by the health check itself. Free space and
+// free inodes are reported alongside the verdict; falling below either
+// threshold is a warning, not a failed readiness check, so orchestrators do not
+// restart a node over resource pressure that it can still work through. A
+// volume can run out of inodes while plenty of bytes remain, which is why both
+// are sampled.
 function checkStorageWritable(dataDir, options = {}) {
   const minFreeBytes = resolveNonNegativeInt(options.minFreeBytes, DEFAULT_MIN_FREE_BYTES);
+  const minFreeInodes = resolveNonNegativeInt(options.minFreeInodes, DEFAULT_MIN_FREE_INODES);
   const result = {
     writable: false,
     path: dataDir || null,
@@ -493,7 +525,11 @@ function checkStorageWritable(dataDir, options = {}) {
     freeBytes: null,
     minFreeBytes,
     lowSpace: false,
-    freeBytesError: null
+    freeBytesError: null,
+    freeInodes: null,
+    minFreeInodes,
+    lowInodes: false,
+    inodeError: null
   };
   if (!dataDir) {
     result.error = 'No data directory configured';
@@ -503,10 +539,13 @@ function checkStorageWritable(dataDir, options = {}) {
   let probePath = null;
   try {
     fs.mkdirSync(dataDir, { recursive: true });
-    const space = readFreeSpace(dataDir);
-    result.freeBytes = space.freeBytes;
-    result.freeBytesError = space.error;
-    result.lowSpace = space.freeBytes !== null && space.freeBytes < minFreeBytes;
+    const stats = readFilesystemStats(dataDir, options.statfs);
+    result.freeBytes = stats.freeBytes;
+    result.freeBytesError = stats.error;
+    result.lowSpace = stats.freeBytes !== null && stats.freeBytes < minFreeBytes;
+    result.freeInodes = stats.freeInodes;
+    result.inodeError = stats.inodeError;
+    result.lowInodes = stats.freeInodes !== null && stats.freeInodes < minFreeInodes;
     probePath = path.join(dataDir, `.femtochain-health-${process.pid}.tmp`);
     fs.writeFileSync(probePath, 'ok');
     fs.unlinkSync(probePath);
@@ -558,7 +597,11 @@ function sendHealth(res, chain, healthCache) {
     freeBytes: null,
     minFreeBytes: null,
     lowSpace: false,
-    freeBytesError: null
+    freeBytesError: null,
+    freeInodes: null,
+    minFreeInodes: null,
+    lowInodes: false,
+    inodeError: null
   };
   const healthy = state.chainValid && storage.writable;
 
@@ -696,6 +739,7 @@ if (require.main === module) {
   let connectionsCheckingInterval = process.env.FEMTOCHAIN_API_CONNECTIONS_CHECK_INTERVAL;
   let healthTtl = process.env.FEMTOCHAIN_API_HEALTH_TTL;
   let minFreeBytes = process.env.FEMTOCHAIN_API_MIN_FREE_BYTES;
+  let minFreeInodes = process.env.FEMTOCHAIN_API_MIN_FREE_INODES;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--port' || args[i] === '-p') port = parseInt(args[++i]);
@@ -710,12 +754,13 @@ if (require.main === module) {
     else if (args[i] === '--check-interval') connectionsCheckingInterval = parseInt(args[++i]);
     else if (args[i] === '--health-ttl') healthTtl = parseInt(args[++i]);
     else if (args[i] === '--min-free-bytes') minFreeBytes = parseInt(args[++i]);
+    else if (args[i] === '--min-free-inodes') minFreeInodes = parseInt(args[++i]);
   }
 
   start(port, dataDir, {
     apiToken, rateLimit, rateLimitMaxClients, maxBodyBytes,
     headersTimeout, requestTimeout, keepAliveTimeout, connectionsCheckingInterval,
-    healthTtl, minFreeBytes
+    healthTtl, minFreeBytes, minFreeInodes
   });
 }
 
